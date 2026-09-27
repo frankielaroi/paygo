@@ -84,39 +84,52 @@ export class RefreshTokenService {
   ): Promise<RotatedRefreshToken> {
     const tokenHash = this.hash(presented);
 
+    const existing = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { user: { select: { id: true, isActive: true } } },
+    });
+
+    if (!existing) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    // Reuse detection runs OUTSIDE a transaction on purpose. The revocation has to commit
+    // and the request has to fail, and those two cannot happen in one transaction: the
+    // throw would roll the revocation back.
+    if (existing.revokedAt) {
+      const revoked = await this.revokeAllForUser(existing.userId);
+
+      this.logger.warn(
+        `Reuse of a revoked refresh token for user ${existing.userId}. ` +
+          `Revoked ${revoked} session(s).`,
+      );
+
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    if (existing.expiresAt.getTime() <= Date.now()) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    if (!existing.user.isActive) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    const token = this.generate();
+    const expiresAt = this.expiryFromNow();
+
     return this.prisma.$transaction(async (tx) => {
-      const existing = await tx.refreshToken.findUnique({
-        where: { tokenHash },
-        include: { user: { select: { id: true, isActive: true } } },
+      // Claim the row conditionally. Two concurrent refreshes with the same token both pass
+      // the checks above; only the one that flips revokedAt from null wins, and the loser is
+      // treated as a reuse rather than being handed a second valid session.
+      const claimed = await tx.refreshToken.updateMany({
+        where: { id: existing.id, revokedAt: null },
+        data: { revokedAt: new Date() },
       });
 
-      if (!existing) {
+      if (claimed.count !== 1) {
         throw new UnauthorizedException('Invalid refresh token');
       }
-
-      if (existing.revokedAt) {
-        this.logger.warn(
-          `Reuse of a revoked refresh token for user ${existing.userId}. Revoking all sessions.`,
-        );
-
-        await tx.refreshToken.updateMany({
-          where: { userId: existing.userId, revokedAt: null },
-          data: { revokedAt: new Date() },
-        });
-
-        throw new UnauthorizedException('Invalid refresh token');
-      }
-
-      if (existing.expiresAt.getTime() <= Date.now()) {
-        throw new UnauthorizedException('Invalid refresh token');
-      }
-
-      if (!existing.user.isActive) {
-        throw new UnauthorizedException('Invalid refresh token');
-      }
-
-      const token = this.generate();
-      const expiresAt = this.expiryFromNow();
 
       const replacement = await tx.refreshToken.create({
         data: {
@@ -130,7 +143,7 @@ export class RefreshTokenService {
 
       await tx.refreshToken.update({
         where: { id: existing.id },
-        data: { revokedAt: new Date(), replacedById: replacement.id },
+        data: { replacedById: replacement.id },
       });
 
       return { token, expiresAt, userId: existing.userId };

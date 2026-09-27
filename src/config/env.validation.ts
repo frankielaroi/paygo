@@ -5,21 +5,33 @@ import { z } from 'zod';
  * "a missing or malformed JWT key" from a 500 on the first login into a refusal to boot.
  */
 const base64Pem = (label: string) =>
-  z
-    .string()
-    .min(1, `${label} is required`)
-    .refine(
-      (value) => {
-        try {
-          return Buffer.from(value, 'base64')
-            .toString('utf8')
-            .includes('-----BEGIN');
-        } catch {
-          return false;
-        }
-      },
-      { message: `${label} must be a base64-encoded PEM key` },
-    );
+  // A missing variable is preprocessed to '' so the failure reads as "is required" rather
+  // than zod's "expected string, received undefined". This message goes to whoever is
+  // trying to deploy.
+  z.preprocess(
+    (value) => value ?? '',
+    z
+      .string()
+      .min(1, `${label} is required`)
+      .refine(
+        (value) => {
+          // Already reported by min(1). Returning true here keeps one message per variable
+          // instead of both "is required" and "must be a base64-encoded PEM key".
+          if (value === '') {
+            return true;
+          }
+
+          try {
+            return Buffer.from(value, 'base64')
+              .toString('utf8')
+              .includes('-----BEGIN');
+          } catch {
+            return false;
+          }
+        },
+        { message: `${label} must be a base64-encoded PEM key` },
+      ),
+  );
 
 /** Accepts "15m", "7d", "3600s" or a plain number of seconds. */
 const duration = z
@@ -49,10 +61,20 @@ export const envSchema = z.object({
   JWT_EXPIRES_IN: duration.default('15m'),
   JWT_ISSUER: z.string().min(1).default('paygo'),
 
-  REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().max(365).default(30),
+  REFRESH_TOKEN_TTL_DAYS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(365)
+    .default(30),
 
   LOGIN_MAX_ATTEMPTS: z.coerce.number().int().positive().max(100).default(5),
-  LOGIN_LOCKOUT_MINUTES: z.coerce.number().int().positive().max(1440).default(15),
+  LOGIN_LOCKOUT_MINUTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(1440)
+    .default(15),
   LOGIN_RATE_LIMIT: z.coerce.number().int().positive().default(10),
   LOGIN_RATE_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
 

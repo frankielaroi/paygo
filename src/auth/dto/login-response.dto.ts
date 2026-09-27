@@ -21,7 +21,8 @@ export class LoggedInUserDto {
 /** Response shape for a successful login. Never includes the password hash. */
 export class LoginResponseDto {
   @ApiProperty({
-    description: 'Short-lived RS256 JWT. Send as `Authorization: Bearer <token>`.',
+    description:
+      'Short-lived RS256 JWT. Send as `Authorization: Bearer <token>`.',
   })
   accessToken!: string;
 

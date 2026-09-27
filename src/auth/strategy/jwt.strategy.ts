@@ -1,5 +1,6 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { Env } from '../../config/env.validation';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { jwtKeyConfig } from '../../config/jwt.config';
@@ -11,7 +12,7 @@ import { isStaffJwtPayload } from '../jwt-payload';
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
-    config: ConfigService,
+    config: ConfigService<Env, true>,
     private readonly prisma: PrismaService,
   ) {
     const { publicKey, issuer } = jwtKeyConfig(config);

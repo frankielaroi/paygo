@@ -3,7 +3,8 @@ import { IsString, Length } from 'class-validator';
 
 export class RefreshDto {
   @ApiProperty({
-    description: 'The refresh token issued by POST /auth/login or a previous refresh',
+    description:
+      'The refresh token issued by POST /auth/login or a previous refresh',
   })
   @IsString()
   // 32 random bytes as base64url is 43 characters. Bounded so an oversized body cannot

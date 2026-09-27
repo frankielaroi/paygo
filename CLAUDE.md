@@ -17,16 +17,21 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
   and `CustomerContact` models. One migration applied: `init_users_customers_rbac`.
 - RBAC: `StaffRole`, the permission map in `src/users/enums/role.enum.ts`, the
   `@Roles` / `@RequirePermissions` / `@Public` / `@CurrentUser` decorators, and `RolesGuard`.
-- Auth (`src/auth/`): RS256 JWT login at `POST /auth/login`, `GET /auth/me`, argon2id
-  password hashing, `JwtStrategy`, and `JwtAuthGuard`. Both guards are registered globally
-  in `AppModule`, so every new route is protected unless it is marked `@Public`.
+- Auth (`src/auth/`): RS256 JWT access tokens, rotating refresh tokens, argon2id password
+  hashing, `JwtStrategy`, `JwtAuthGuard`. Endpoints: `POST /auth/login`, `POST /auth/refresh`,
+  `POST /auth/logout`, `GET /auth/me`.
+- Login protection: per-IP rate limiting (`@nestjs/throttler`, a separate `login` bucket) and
+  per-account lockout on `User.failedLoginAttempts` / `lockedUntil`.
+- Environment validation at boot (`src/config/env.validation.ts`, zod). A missing or
+  malformed key aborts the bootstrap.
 - Swagger at `/api` (JSON at `/api-json`), configured in `src/config/swagger.ts`.
 - An admin seed (`npm run db:seed`), idempotent on email and never overwriting an existing
   user's password.
 
 **Not built yet:** plans, contracts, payments, ledger, positions, enforcement, the
-`src/tcp/` device module, Redis/BullMQ, customer (rider) authentication, refresh tokens,
-token revocation on password change, rate limiting on login, and env-var validation at boot.
+`src/tcp/` device module, Redis/BullMQ, customer (rider) authentication, revoking sessions on
+password change (`RefreshTokenService.revokeAllForUser` exists but nothing calls it), and a
+job to delete expired refresh token rows.
 
 Everything below describing those unbuilt pieces is the **target architecture and the
 conventions to follow when adding code**, not files that already exist. When implementing a
@@ -58,7 +63,23 @@ Jest config lives inline in `package.json` with `rootDir: "src"` and
 `testRegex: ".*\\.spec\\.ts$"`, so unit tests must sit **next to the source file** they
 cover. E2E specs live in `test/` and only run via `test:e2e`, which uses its own config.
 
-### Code Quality
+### Code Quality: no `any`
+
+`any` is a lint error, and `noImplicitAny` is on. The rule that actually does the work is the
+`no-unsafe-*` family, not `no-explicit-any`: most `any` in a Nest codebase arrives from
+untyped library returns rather than from someone typing the word.
+
+Consequences worth knowing before reaching for a cast:
+
+- `jest.Mock` is `any`-typed. Narrow it once per spec with
+  `as unknown as jest.Mock<unknown, [ArgsType]>` and read the calls through that, rather
+  than asserting on `.mock.calls[0][0]` inline.
+- `expect.objectContaining()` returns `any`. Assert on typed call arguments instead.
+- `app.getHttpServer()` is `any` unless the app is typed: use
+  `INestApplication<App>` with `App` from `supertest/types`, which is what the e2e specs do.
+- Generated Prisma code is excluded from linting, so its internals do not count.
+
+
 
 ```bash
 npm run format   # prettier --write over src/ and test/
@@ -377,9 +398,9 @@ concurrent-device count before trusting it at fleet scale.
   rather than from the token. A deactivation or demotion therefore takes effect immediately
   instead of at token expiry. Do not "optimise" this into trusting the token payload without
   first adding real revocation.
-- `JwtAuthGuard` and `RolesGuard` are both registered globally in `AppModule`, in that order:
-  authenticate, then authorize. A new route is protected by default and opts out with
-  `@Public()`.
+- `ThrottlerGuard`, `JwtAuthGuard` and `RolesGuard` are registered globally in `AppModule`, in
+  that order: rate limit before doing any work, then authenticate, then authorize. A new route
+  is protected by default and opts out with `@Public()`.
 - **Login must not leak which accounts exist.** Every failure (unknown email, wrong password,
   deactivated account) returns the same `401 Invalid credentials`, and the unknown-email path
   still runs an argon2 verification against a dummy hash so the response time does not
@@ -410,6 +431,52 @@ concurrent-device count before trusting it at fleet scale.
   can be raised in one place. `verify` treats a malformed stored hash as a failed password
   rather than throwing, so a corrupt row cannot 500 and mark an account as special.
 - Never log tokens, keys, password hashes, or full payment payloads.
+
+### Sessions: rotating refresh tokens
+
+Access tokens are short-lived and carry the role; refresh tokens are long-lived and
+revocable. `RefreshTokenService` owns them.
+
+- A refresh token is **opaque random bytes**, not a JWT, stored only as a **SHA-256 hash**.
+  A signed self-contained refresh token cannot be revoked without a blocklist, which ends up
+  being the same database lookup with worse properties. Hashing means a database leak yields
+  nothing replayable.
+- **Rotation is unconditional.** Every refresh consumes the presented token and issues a new
+  one, so a stolen token is useful only until the legitimate client next refreshes.
+- **Replaying a rotated token revokes every session for that account**, including the
+  replacement the legitimate client holds. Either the token leaked or someone is replaying it;
+  neither is recoverable quietly, so both parties are forced to log in again.
+- **The reuse revocation must not run inside a transaction that then throws.** The revocation
+  has to commit while the request fails, and one transaction cannot do both: the throw rolls
+  the revocation back, leaving the leaked family live. This was a real bug here, and it passed
+  its unit tests until the `$transaction` test double was made to roll back on throw. Any test
+  double for `$transaction` in this codebase must model rollback.
+- Rotation claims the row with a conditional `updateMany` on `revokedAt: null` and checks
+  `count === 1`. Two concurrent refreshes with the same token both pass the earlier checks;
+  only one may win, and the loser is treated as a reuse rather than handed a second session.
+- Confirmed state comes from the database. `revoke` is idempotent, so a client can always
+  complete a logout.
+- `revokeAllForUser` exists for password changes and suspected compromise. Wire it into the
+  password change flow when that ships.
+
+### Login protection: two independent layers
+
+Both are needed, and neither substitutes for the other.
+
+- **Per IP**, via `@nestjs/throttler`, on its own `login` bucket so credential endpoints do not
+  share a budget with ordinary traffic (`@Throttle({ login: {} })`). Configured by
+  `LOGIN_RATE_LIMIT` and `LOGIN_RATE_WINDOW_SECONDS`.
+- **Per account**, via `User.failedLoginAttempts` and `lockedUntil`. IP limits do nothing
+  against a distributed attack on one known admin address, which is the realistic threat.
+- **The lockout must not become an oracle.** A locked account returns the same
+  `401 Invalid credentials` as a wrong password, and the locked path still runs an argon2
+  verification against a dummy hash so the response time does not reveal the lock. Otherwise
+  the endpoint answers "does this email exist" for anyone willing to fail five times.
+- **Keep the lockout window short** (`LOGIN_LOCKOUT_MINUTES`, default 15). A long lockout
+  hands anyone who knows an admin's email a way to keep that person out of the system. This is
+  a genuine tradeoff, not a setting to raise casually.
+- Failed attempts are only counted against accounts that exist, so the table cannot be used to
+  probe for addresses.
 
 ### Validation & API Contract
 
@@ -454,8 +521,16 @@ Set up in `src/config/swagger.ts` and mounted from `main.ts`. UI at **`/api`**, 
 
 - All configuration comes from the environment through `ConfigService`. Do not read
   `process.env` outside `src/config/`.
-- Validate the environment at boot (Joi or a Zod schema in `ConfigModule.forRoot`) so a
-  missing `DATABASE_URL` or key fails at startup, not on first request.
+- The environment **is** validated at boot: `validateEnv` (zod) is passed to
+  `ConfigModule.forRoot`, so a missing `DATABASE_URL` or a JWT key that is not a base64 PEM
+  aborts the bootstrap instead of failing on the first login. Add new variables to that schema,
+  not just to `.env`.
+- The schema **strips unknown variables**, so `ConfigService` only exposes what is declared.
+  A variable that is not in the schema cannot be read through `ConfigService` at all.
+- Inject `ConfigService<Env, true>` and read with `config.get('KEY', { infer: true })`, which
+  is typed against the schema. An untyped `ConfigService` returns `unknown` or `any` and
+  defeats both the schema and the no-any rule.
+- Defaults live in the schema, in one place, not scattered as `?? '15m'` at call sites.
 - `.env` is git-ignored; keep a committed `.env.example` listing every variable with safe
   placeholder values.
 
@@ -471,6 +546,10 @@ Expected variables:
 | `JWT_EXPIRES_IN` | Access token lifetime (default `15m`) |
 | `JWT_ISSUER` | Expected `iss` claim, verified on every request (default `paygo`) |
 | `SWAGGER_ENABLED` | Set to `true` to publish `/api` in production |
+| `REFRESH_TOKEN_TTL_DAYS` | Refresh token lifetime (default 30) |
+| `LOGIN_MAX_ATTEMPTS` | Failed logins before a per-account lockout (default 5) |
+| `LOGIN_LOCKOUT_MINUTES` | Lockout duration; keep it short (default 15) |
+| `LOGIN_RATE_LIMIT` / `LOGIN_RATE_WINDOW_SECONDS` | Per-IP limit on credential endpoints |
 | `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` | Used only by `npm run db:seed` |
 | `REDIS_HOST` / `REDIS_PORT` | BullMQ connection |
 | `TCP_DEVICE_PORT` | Raw TCP listener for Teltonika devices (default 5027) |
@@ -506,6 +585,13 @@ Expected variables:
   tampering with a token in a test, alter a character in the **middle** of the signature: the
   final base64url character of an RSA signature carries unused bits, so changing it can
   decode to the same signature and the test will pass a token that was never really modified.
+- **A test double must not be more forgiving than the real thing.** The `$transaction` double
+  in `refresh-token.service.spec.ts` restores a snapshot when the callback throws, because
+  without that a write-then-throw looks committed and a rollback bug passes its own tests. That
+  is exactly what happened here once.
+- When a test is meant to catch a specific bug, **verify that it does**: reintroduce the bug,
+  watch the test fail, then restore. A test written against reasoning about the code, rather
+  than against the failing behaviour, can easily assert nothing.
 - E2E tests in `test/` run against a **dedicated test database**, never the development
   one, provisioned with `prisma migrate deploy` and truncated between tests.
 

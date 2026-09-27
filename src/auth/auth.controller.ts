@@ -88,7 +88,9 @@ export class AuthController {
       'Idempotent: revoking an unknown or already-revoked token succeeds, so a client can ' +
       'always complete a logout.',
   })
-  @ApiNoContentResponse({ description: 'Token revoked, or was already invalid' })
+  @ApiNoContentResponse({
+    description: 'Token revoked, or was already invalid',
+  })
   logout(@Body() dto: RefreshDto): Promise<void> {
     return this.auth.logout(dto.refreshToken);
   }

@@ -1,14 +1,15 @@
-import { ConfigService } from '@nestjs/config';
+import type { ConfigService } from '@nestjs/config';
 import type { StringValue } from 'ms';
+import type { Env } from './env.validation';
 
 /**
  * RS256 keys are stored base64-encoded so a PEM fits on one line in a .env file or a
- * secrets manager without newline escaping. Decoded here, which is the only place in the
- * app that turns the env value into a key.
+ * secrets manager without newline escaping. This is the only place that turns the env value
+ * into a key. The format is validated at boot by env.validation.ts, so a failure here means
+ * the value changed after startup.
  */
-function decodeKey(config: ConfigService, variable: string): string {
-  const encoded = config.getOrThrow<string>(variable);
-  const pem = Buffer.from(encoded, 'base64').toString('utf8');
+function decodeKey(pemBase64: string, variable: string): string {
+  const pem = Buffer.from(pemBase64, 'base64').toString('utf8');
 
   if (!pem.includes('-----BEGIN')) {
     throw new Error(
@@ -23,15 +24,21 @@ export interface JwtKeyConfig {
   privateKey: string;
   publicKey: string;
   /** The type jsonwebtoken accepts, e.g. "15m". A bare string will not compile. */
-  expiresIn: StringValue | number;
+  expiresIn: StringValue;
   issuer: string;
 }
 
-export function jwtKeyConfig(config: ConfigService): JwtKeyConfig {
+export function jwtKeyConfig(config: ConfigService<Env, true>): JwtKeyConfig {
   return {
-    privateKey: decodeKey(config, 'JWT_PRIVATE_KEY_BASE64'),
-    publicKey: decodeKey(config, 'JWT_PUBLIC_KEY_BASE64'),
-    expiresIn: (config.get<string>('JWT_EXPIRES_IN') ?? '15m') as StringValue,
-    issuer: config.get<string>('JWT_ISSUER') ?? 'paygo',
+    privateKey: decodeKey(
+      config.get('JWT_PRIVATE_KEY_BASE64', { infer: true }),
+      'JWT_PRIVATE_KEY_BASE64',
+    ),
+    publicKey: decodeKey(
+      config.get('JWT_PUBLIC_KEY_BASE64', { infer: true }),
+      'JWT_PUBLIC_KEY_BASE64',
+    ),
+    expiresIn: config.get('JWT_EXPIRES_IN', { infer: true }),
+    issuer: config.get('JWT_ISSUER', { infer: true }),
   };
 }

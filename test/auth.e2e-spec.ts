@@ -1,8 +1,10 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
+import type { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
 import type { LoginResponseDto } from '../src/auth/dto/login-response.dto';
+import type { RefreshResponseDto } from '../src/auth/dto/refresh-response.dto';
 
 interface ErrorBody {
   message: string | string[];
@@ -13,7 +15,7 @@ interface ErrorBody {
  * (npm run db:seed) and the credentials in .env.
  */
 describe('Auth (e2e)', () => {
-  let app: INestApplication;
+  let app: INestApplication<App>;
   const email = process.env.SEED_ADMIN_EMAIL ?? 'admin@paygo.local';
   const password = process.env.SEED_ADMIN_PASSWORD ?? 'ChangeMe!2026';
 
@@ -102,5 +104,84 @@ describe('Auth (e2e)', () => {
       .get('/auth/me')
       .set('Authorization', `Bearer ${tampered}`)
       .expect(401);
+  });
+
+  describe('refresh tokens', () => {
+    const loginFresh = async (): Promise<LoginResponseDto> => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email, password })
+        .expect(200);
+
+      return response.body as LoginResponseDto;
+    };
+
+    it('rotates the refresh token and returns a working access token', async () => {
+      const login = await loginFresh();
+
+      const refreshed = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: login.refreshToken })
+        .expect(200);
+
+      const body = refreshed.body as RefreshResponseDto;
+      expect(body.refreshToken).not.toBe(login.refreshToken);
+
+      await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${body.accessToken}`)
+        .expect(200);
+    });
+
+    // Theft detection: replaying a rotated token revokes the whole family, including the
+    // replacement the legitimate client is holding.
+    it('revokes every session when a rotated token is replayed', async () => {
+      const login = await loginFresh();
+
+      const refreshed = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: login.refreshToken })
+        .expect(200);
+
+      const replacement = (refreshed.body as RefreshResponseDto).refreshToken;
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: login.refreshToken })
+        .expect(401);
+
+      // This is the assertion that fails if the revocation is done inside the transaction
+      // that then throws: the rollback would leave this token usable.
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: replacement })
+        .expect(401);
+    });
+
+    it('rejects an unknown refresh token', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: 'a'.repeat(43) })
+        .expect(401);
+    });
+
+    it('logs out idempotently and invalidates the token', async () => {
+      const login = await loginFresh();
+
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .send({ refreshToken: login.refreshToken })
+        .expect(204);
+
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .send({ refreshToken: login.refreshToken })
+        .expect(204);
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: login.refreshToken })
+        .expect(401);
+    });
   });
 });
