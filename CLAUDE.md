@@ -11,21 +11,27 @@ in proportion to what they have paid.
 Financed assets are GPS-tracked and can be **remotely immobilized** when a contract falls
 into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* below).
 
-**Built so far:** Prisma 7 + Postgres wiring (`src/prisma/`), the `User` (staff) and
-`Customer` (rider) models with `CustomerContact`, and the RBAC layer — `StaffRole`, the
-permission map in `src/users/enums/role.enum.ts`, `@Roles`/`@RequirePermissions`/`@Public`/
-`@CurrentUser`, and `RolesGuard`. One migration is applied:
-`init_users_customers_rbac`.
+**Built so far:**
 
-**Not built yet:** authentication itself (no `auth/` module, no `JwtAuthGuard`, nothing
-populates `request.user`, and `User.passwordHash` is never written), plans, contracts,
-payments, ledger, positions, enforcement, the `src/tcp/` device module, Redis/BullMQ, and
-Swagger.
+- Prisma 7 + Postgres wiring (`src/prisma/`), with the `User` (staff), `Customer` (rider)
+  and `CustomerContact` models. One migration applied: `init_users_customers_rbac`.
+- RBAC: `StaffRole`, the permission map in `src/users/enums/role.enum.ts`, the
+  `@Roles` / `@RequirePermissions` / `@Public` / `@CurrentUser` decorators, and `RolesGuard`.
+- Auth (`src/auth/`): RS256 JWT login at `POST /auth/login`, `GET /auth/me`, argon2id
+  password hashing, `JwtStrategy`, and `JwtAuthGuard`. Both guards are registered globally
+  in `AppModule`, so every new route is protected unless it is marked `@Public`.
+- Swagger at `/api` (JSON at `/api-json`), configured in `src/config/swagger.ts`.
+- An admin seed (`npm run db:seed`), idempotent on email and never overwriting an existing
+  user's password.
+
+**Not built yet:** plans, contracts, payments, ledger, positions, enforcement, the
+`src/tcp/` device module, Redis/BullMQ, customer (rider) authentication, refresh tokens,
+token revocation on password change, rate limiting on login, and env-var validation at boot.
 
 Everything below describing those unbuilt pieces is the **target architecture and the
 conventions to follow when adding code**, not files that already exist. When implementing a
 feature, create the structure described here rather than inventing a new one. Do not cite
-paths from this document as if they were already present — check first.
+paths from this document as if they were already present: check first.
 
 ## Common Development Commands
 
@@ -79,7 +85,7 @@ npm run db:studio                                  # browse data
   Import from `../generated/prisma/client`; enums come from `../generated/prisma/enums`.
 - The output lives under `src/` on purpose. Outside it, `tsc` widens the rootDir and the
   build emits `dist/src/main.js`, breaking `npm run start:prod`.
-- **A driver adapter is required** — there is no `datasourceUrl` or `datasources` option.
+- **A driver adapter is required**, there is no `datasourceUrl` or `datasources` option.
   `PrismaService` constructs `new PrismaPg({ connectionString })` from `@prisma/adapter-pg`.
 - Connection config lives in `prisma7.config.ts`, and `datasource db` in the schema has no
   `url`. The Prisma CLI does **not** auto-load `.env`; `prisma7.config.ts` does it via
@@ -94,6 +100,37 @@ npm run db:studio                                  # browse data
 - Never hand-edit an applied migration. Write a new one.
 - `migrate reset` and `migrate dev` are destructive against the target database. Confirm
   `DATABASE_URL` points at a local/dev database before running either.
+
+### Dependency constraint: this project is on NestJS 11, so Nest packages stay on CJS-era majors
+
+The Nest 12 line of the satellite packages is published as **pure ESM**, which Jest cannot
+`require` on Node 22, and it also peer-requires `@nestjs/common@^12`. Every affected package
+is therefore pinned to the last CommonJS major. Do not "update" these without moving the
+whole app to Nest 12 and giving Jest an ESM setup:
+
+| Package | Pinned | Latest is ESM |
+| --- | --- | --- |
+| `@nestjs/config` | 4.0.4 | 12.x |
+| `@nestjs/jwt` | 11.0.2 | 12.x |
+| `@nestjs/passport` | 11.0.5 | 12.x |
+| `@nestjs/swagger` | 11.4.7 | 12.x |
+
+Symptom if one slips through: `createRequireEsmError` / "Must use import to load ES Module"
+from Jest, while `npm run start` keeps working. The app boots either way, so only the tests
+catch it.
+
+### Test runner quirks this project has to live with
+
+- `moduleNameMapper` maps `^(\.{1,2}/.*)\.js$` to `$1` in both Jest configs. The generated
+  Prisma client uses NodeNext `.js` specifiers that point at `.ts` files, which the CJS
+  resolver cannot follow.
+- `test:e2e` runs with `NODE_OPTIONS=--experimental-vm-modules` via `cross-env`. Prisma 7
+  loads its query compiler through a dynamic `import()`, and without the flag any e2e test
+  that boots `PrismaModule` fails with "A dynamic import callback was invoked without
+  --experimental-vm-modules".
+- `db:seed` runs under **tsx**, not ts-node. ts-node cannot resolve the generated client's
+  `.js` specifiers at runtime.
+- The auth e2e spec needs the seeded admin and the `SEED_ADMIN_*` values from `.env`.
 
 ### Docker
 
@@ -116,7 +153,7 @@ NestJS application, modular by domain feature.
   `PrismaModule`, and each feature module.
 - Every feature is a self-contained module directory: controller, service, DTOs, and its
   own guards/processors where relevant. Features never import another feature's service
-  directly from a deep path — import the owning module and inject the exported provider.
+  directly from a deep path, import the owning module and inject the exported provider.
 - Cross-cutting infrastructure (Prisma, config, logging, queue setup) lives in
   `src/common/` or its own top-level module, never inside a feature.
 
@@ -165,7 +202,7 @@ src/
   `await this.$connect()`); it is provided and exported by a **global** `PrismaModule` so
   feature services inject it without re-importing.
 - Services depend on `PrismaService` directly. Do not add a generic repository layer
-  around Prisma — the client *is* the data-access layer.
+  around Prisma, the client *is* the data-access layer.
 - Prisma types (`Prisma.CustomerCreateInput`, `Prisma.ContractGetPayload<...>`) are the
   internal model types. DTOs exist for the HTTP boundary, not as duplicate models.
 - Use `prisma.$transaction` for any operation that writes more than one row and must be
@@ -180,12 +217,12 @@ back office (admin, field agent). `Customer` is the rider being financed. Do not
 into one table with a role column, and do not add a `CUSTOMER` value to the staff role enum.
 
 - It is a security boundary, not tidiness. With one table, role assignment is the only thing
-  between a rider and admin — a default-value bug, a mass-assignment slip, or a seeded test
+  between a rider and admin, a default-value bug, a mass-assignment slip, or a seeded test
   row becomes privilege escalation. Separate models make that unrepresentable.
 - The records share almost no columns. Customers carry KYC (national ID, photo, address,
   guarantors, next of kin); staff carry branch and supervisor. Merged, every one of those is
   nullable and every query is filtered by role.
-- Customer identity is a **phone number**, not an email and password — a field agent
+- Customer identity is a **phone number**, not an email and password, a field agent
   registers them, and many never sign in at all. If a rider app ships later, give `Customer`
   its own phone/OTP credential rather than moving riders into `users`.
 - `contract.customerId`, ledger rows and audit records all point at `Customer`. Changing
@@ -206,7 +243,7 @@ This is a financing system; arithmetic bugs are the expensive kind.
   or `DELETE` on the ledger.
 - Derive balances from the ledger. Cached balances on a contract, if any, are a
   denormalization that must be recomputed inside the same transaction that writes entries.
-- Amount validation belongs in DTOs (`@IsInt()`, `@IsPositive()`) *and* in the service —
+- Amount validation belongs in DTOs (`@IsInt()`, `@IsPositive()`) *and* in the service,
   the DTO guards the shape, the service guards the business rule.
 
 ### Device Telemetry & Remote Immobilization (Teltonika TCP)
@@ -218,7 +255,7 @@ management has to account for both.
 
 **This is one application, not two services.** The device layer and the REST API share the
 process, the Prisma client, and the DI container. Decoded telemetry is written through the
-same services the REST controllers use — there is no separate telemetry store and no second
+same services the REST controllers use, there is no separate telemetry store and no second
 source of truth. The enforcement job injects `TcpServerService` and calls a method on it;
 there is no internal HTTP hop between business logic and device control. Do not propose
 splitting the TCP listener into its own service without a concrete reason, and if it is ever
@@ -228,11 +265,11 @@ split, the shared database and service layer are what must not be duplicated.
 the binary protocol and is the only thing that knows Codec 8 exists. The frontend's live-map
 and history endpoints are ordinary REST/WebSocket handlers reading what was persisted. No
 controller reaches into the socket map, and no frontend request is served straight off a
-device connection — a device that is offline must degrade to last-known state, not hang.
+device connection, a device that is offline must degrade to last-known state, not hang.
 
 **Horizontal scaling constraint (not a day-one problem).** A device's socket lives on exactly
 one instance. With a single instance, `sendCommand` always finds the connection and this is a
-non-issue — which covers a lot of runway. Behind a load balancer it is not: an enforcement job
+non-issue, which covers a lot of runway. Behind a load balancer it is not: an enforcement job
 on instance A cannot reach a tracker connected to instance B, and `sendCommand` returning
 "not connected" would be a **false negative** that silently skips an immobilization. Before
 running more than one instance, the socket registry has to become shared (Redis-backed
@@ -244,7 +281,7 @@ Protocol flow: device opens a socket → IMEI handshake → `TcpServerService` k
 `Map<imei, connection>` → incoming Codec 8 AVL packets are parsed and ACKed → outgoing
 `setdigout` relay commands are encoded and written back to that socket.
 
-**Layering — this is the rule that matters most here:**
+**Layering, this is the rule that matters most here:**
 
 - `src/tcp/` is a **protocol layer only**. It parses bytes, ACKs, and writes bytes. It
   contains no financing logic, no arrears checks, and no database decisions.
@@ -252,8 +289,8 @@ Protocol flow: device opens a socket → IMEI handshake → `TcpServerService` k
   It does not check speed, ignition, or anything else.
 - **The safety interlock lives in `enforcement/`, never in `tcp/`.** Before any
   `immobilize` call, the reconciler must confirm from persisted telemetry that the asset is
-  stationary — speed == 0 **and** ignition off, sustained for
-  `IMMOBILIZE_STATIONARY_SECONDS` — plus that the contract is genuinely in arrears.
+  stationary, speed == 0 **and** ignition off, sustained for
+  `IMMOBILIZE_STATIONARY_SECONDS`, plus that the contract is genuinely in arrears.
   Immobilizing a moving vehicle can kill someone. Do not add a convenience path that reaches
   `sendCommand` without passing that check, and do not "temporarily" bypass it for testing
   against a live device.
@@ -270,7 +307,7 @@ state (`MOBILE` / `IMMOBILIZED`) plus the last **device-confirmed** state. Nothi
 - The reconciler compares desired against confirmed and emits a command when they diverge
   *and* it is safe right now. It runs on device handshake, on telemetry arrival, and on a
   timer.
-- Confirmed state advances only on the device's response or subsequent telemetry — **never**
+- Confirmed state advances only on the device's response or subsequent telemetry, **never**
   on a successful `write()`.
 
 **Why not a pending-command queue.** A device reconnecting is usually a device that was just
@@ -282,14 +319,14 @@ double-execution on retry, because convergence is idempotent where command repla
 
 **Restore is asymmetric with immobilize and must stay that way.** Immobilize needs the
 interlock because it can kill someone; restore cannot hurt anyone. Restore is therefore
-automatic and ungated — it fires immediately, including the moment an offline tracker
+automatic and ungated, it fires immediately, including the moment an offline tracker
 reconnects. A rider who has paid must not be stranded waiting for someone to click a button;
 that is their day's income.
 
 - **Restore triggers on "contract became current", not "payment received."** The decision
   reads the derived ledger balance inside the same transaction that posts the payment
   entries. Triggering off the webhook would let a token payment unlock a bike that is months
-  down — and triggering off the balance means arrears cleared by an admin adjustment,
+  down, and triggering off the balance means arrears cleared by an admin adjustment,
   write-off or restructure restores the bike too, which is correct.
 - The "current enough to restore" threshold is **configuration**, not a literal in the
   service: fully current, within a grace amount, or one installment behind. It will be tuned.
@@ -297,48 +334,61 @@ that is their day's income.
   confirmed stationary moment.
 
 Because desired state is a single mutable field, keep an **append-only log of desired-state
-changes** — actor, contract, arrears snapshot, and the telemetry the interlock relied on.
+changes**, actor, contract, arrears snapshot, and the telemetry the interlock relied on.
 That log is what answers a rider disputing an immobilization.
 
 **Telemetry ingestion:**
 
 - `onPositionReceived` must write through to `positions/` (or emit via
-  `@nestjs/event-emitter` for other modules to consume) — not just log. Keep the socket
+  `@nestjs/event-emitter` for other modules to consume), not just log. Keep the socket
   handler fast: hand off to a queue rather than doing heavy work inline.
 - **TCP is a stream, not a message boundary.** `tryParsePackets` must track how many bytes
   `parseCodec8Packet` actually consumed, slice exactly that much off the buffer, and loop
   until the buffer is empty or holds an incomplete packet. Clearing the whole buffer after
-  one packet silently drops data whenever a device sends packets back-to-back — which
+  one packet silently drops data whenever a device sends packets back-to-back, which
   happens in weak-signal areas, exactly when the data matters.
 - Devices drop and reconnect constantly; treat it as normal. Overwriting the `Map` entry on
-  reconnect is the correct behaviour — destroy the superseded socket so it does not leak.
+  reconnect is the correct behaviour, destroy the superseded socket so it does not leak.
 - A socket being present in the map is **not** proof the device is reachable. Never report
   immobilization as confirmed on the basis of a successful `write()`; confirm from the
   device's response or subsequent telemetry.
 - **Verify IO IDs against the actual unit.** IO 239 (ignition) and 240 (movement) are
-  Teltonika standards, but firmware and model differences exist — confirm against the
+  Teltonika standards, but firmware and model differences exist, confirm against the
   specific FMB920 (or other) parameter list, using captured hex, before trusting field
   names.
 - Prefer TLS where the device firmware supports it, terminated ahead of this handler.
   Plaintext device traffic on the public internet is a last resort, and the IMEI handshake
-  alone is not authentication — an IMEI is guessable and spoofable, so never let telemetry
+  alone is not authentication, an IMEI is guessable and spoofable, so never let telemetry
   alone authorize a financial or enforcement action.
 
-Operationally: run behind a process manager or orchestrator restart policy — a crash drops
+Operationally: run behind a process manager or orchestrator restart policy, a crash drops
 every device's connectivity at once, silently. Load test at the real expected
 concurrent-device count before trusting it at fleet scale.
 
 ### Authentication & Authorization
 
-- JWT authentication via Passport, signed with **RS256** — `PRIVATE_KEY` signs,
-  `PUBLIC_KEY` verifies; keys come from the environment and are never committed.
-- `JwtStrategy` in `src/auth/strategy/jwt.strategy.ts` validates the token and resolves
-  the user; `JwtAuthGuard` is registered globally, with `@Public()` opting an endpoint out.
+- JWT authentication via Passport, signed with **RS256**. Keys are stored
+  **base64-encoded PEM** in `JWT_PRIVATE_KEY_BASE64` / `JWT_PUBLIC_KEY_BASE64` so a PEM fits
+  on one line, and are decoded in exactly one place, `src/config/jwt.config.ts`. Keys are
+  never committed; the pair in `.env` is a development pair and must be regenerated per
+  environment.
+- `JwtStrategy` in `src/auth/strategy/jwt.strategy.ts` verifies the token and then
+  **re-reads the user from the database on every request**, returning the role from the row
+  rather than from the token. A deactivation or demotion therefore takes effect immediately
+  instead of at token expiry. Do not "optimise" this into trusting the token payload without
+  first adding real revocation.
+- `JwtAuthGuard` and `RolesGuard` are both registered globally in `AppModule`, in that order:
+  authenticate, then authorize. A new route is protected by default and opts out with
+  `@Public()`.
+- **Login must not leak which accounts exist.** Every failure (unknown email, wrong password,
+  deactivated account) returns the same `401 Invalid credentials`, and the unknown-email path
+  still runs an argon2 verification against a dummy hash so the response time does not
+  differ. Tests assert both properties; keep them passing.
 - RBAC: staff roles enumerated in `src/users/enums/role.enum.ts`, applied with `@Roles(...)`
   and enforced by `RolesGuard`. The staff roles are **admin** and **field agent**. Customers
-  are a separate model and are **not** a role in this enum — see *Database* above.
+  are a separate model and are **not** a role in this enum, see *Database* above.
 - Role boundaries that matter: a field agent must not read or move money belonging to another
-  agent's customers, and **immobilize/restore is not a field-agent capability by default** —
+  agent's customers, and **immobilize/restore is not a field-agent capability by default**,
   an agent in the field is the most likely person to want that button and the least able to
   verify the bike is stopped. Grant it deliberately or not at all.
 - If a rider-facing API ships, it authenticates `Customer` (phone/OTP) on its own path and
@@ -348,21 +398,23 @@ concurrent-device count before trusting it at fleet scale.
   in the guard. Role alone never proves the record belongs to the caller. For customers that
   means comparing against `Customer.assignedAgentId`.
 - Capabilities live in the **permission map** in `src/users/enums/role.enum.ts`, not in
-  database tables — with two fixed roles, a permissions table would be a join on every
+  database tables, with two fixed roles, a permissions table would be a join on every
   request and a migration for every change. Prefer `@RequirePermissions(...)` over
   `@Roles(...)` on routes, so adding a role does not mean revisiting every controller. Move
   the map into the database only when admins need to edit roles at runtime.
 - The principal type `AuthenticatedStaff` carries an explicit `kind: 'staff'`, and
   `RolesGuard` rejects anything else. When customer auth ships, a rider token must not
-  satisfy a staff route just because it carries an id — the guard must never resolve a
+  satisfy a staff route just because it carries an id, the guard must never resolve a
   subject without checking which kind it is.
-- Password hashing with argon2 or bcrypt. Never log tokens, keys, password hashes, or
-  full payment payloads.
+- Password hashing is **argon2id** via `PasswordService`, which owns the parameters so they
+  can be raised in one place. `verify` treats a malformed stored hash as a failed password
+  rather than throwing, so a corrupt row cannot 500 and mark an account as special.
+- Never log tokens, keys, password hashes, or full payment payloads.
 
 ### Validation & API Contract
 
 - A global `ValidationPipe` with `{ whitelist: true, forbidNonWhitelisted: true,
-  transform: true }` — unknown properties are rejected, not silently ignored.
+  transform: true }`, unknown properties are rejected, not silently ignored.
 - Request/response DTOs live in each feature's `dto/`, use `class-validator` decorators,
   and are annotated with `@ApiProperty` for Swagger.
 - Never accept a Prisma input type as a request body; that would let a client write any
@@ -372,9 +424,20 @@ concurrent-device count before trusting it at fleet scale.
 
 ### Swagger / OpenAPI
 
-`@nestjs/swagger` is configured in `main.ts` and served at **`/api`**. Use `DocumentBuilder`
-with `addBearerAuth()`. Every controller gets `@ApiTags`, and every endpoint documents its
-non-2xx responses. Consider disabling the docs route when `NODE_ENV === 'production'`.
+Set up in `src/config/swagger.ts` and mounted from `main.ts`. UI at **`/api`**, document at
+**`/api-json`**.
+
+- **Off by default in production.** `setupSwagger` returns false without mounting when
+  `NODE_ENV === 'production'`, unless `SWAGGER_ENABLED=true` is set explicitly. The document
+  names every endpoint and role boundary in the system, so publishing it is a deliberate act.
+- Bearer auth is registered under the scheme name `bearer`; protected endpoints carry
+  `@ApiBearerAuth('bearer')`. `@Public()` routes deliberately carry no security requirement,
+  which makes the generated document a readable audit of what is unauthenticated.
+- Every controller gets `@ApiTags`, every endpoint an `@ApiOperation` and its non-2xx
+  responses. Response DTOs are real classes with `@ApiProperty`, never inline object literals,
+  so the schema section stays usable.
+- The response DTO is what the document promises. Returning an entity directly would publish
+  the password hash column into the public schema.
 
 ### Background Jobs: Redis + BullMQ
 
@@ -383,7 +446,7 @@ non-2xx responses. Consider disabling the docs route when `NODE_ENV === 'product
   overdue-contract sweeps.
 - Queues are registered in `src/queues/`; processors are `@Processor`-decorated classes
   that delegate to a feature service rather than holding business logic themselves.
-- Job handlers must be **idempotent and retry-safe** — BullMQ will retry, and a retried
+- Job handlers must be **idempotent and retry-safe**, BullMQ will retry, and a retried
   payment job must not double-post to the ledger.
 - Job payloads carry ids, not whole entities; re-read from the database inside the handler.
 
@@ -403,8 +466,12 @@ Expected variables:
 | `DATABASE_URL` | Postgres connection string used by Prisma |
 | `PORT` | HTTP port (`main.ts` falls back to 3000) |
 | `NODE_ENV` | `development` / `test` / `production` |
-| `PRIVATE_KEY` / `PUBLIC_KEY` | RS256 JWT signing keypair (PEM) |
-| `JWT_EXPIRES_IN` | Access token lifetime |
+| `JWT_PRIVATE_KEY_BASE64` | RS256 signing key, base64-encoded PEM |
+| `JWT_PUBLIC_KEY_BASE64` | RS256 verification key, base64-encoded PEM |
+| `JWT_EXPIRES_IN` | Access token lifetime (default `15m`) |
+| `JWT_ISSUER` | Expected `iss` claim, verified on every request (default `paygo`) |
+| `SWAGGER_ENABLED` | Set to `true` to publish `/api` in production |
+| `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` | Used only by `npm run db:seed` |
 | `REDIS_HOST` / `REDIS_PORT` | BullMQ connection |
 | `TCP_DEVICE_PORT` | Raw TCP listener for Teltonika devices (default 5027) |
 | `IMMOBILIZE_STATIONARY_SECONDS` | Interlock: how long an asset must be stopped first |
@@ -412,7 +479,7 @@ Expected variables:
 
 ### Testing Strategy
 
-- Unit tests sit beside the source file and mock `PrismaService` — a plain object of
+- Unit tests sit beside the source file and mock `PrismaService`, a plain object of
   `jest.fn()`s is preferred over a deep mock, so the assertions show the exact query shape.
 - Financial logic (payment allocation, schedule generation, ledger balance, interest or
   fee calculation) is tested at the unit level with explicit numeric fixtures, including
@@ -420,7 +487,7 @@ Expected variables:
   currency rounding.
 - Webhook and payment endpoints get a test that submits the same payload twice and asserts
   exactly one payment and one balanced set of ledger entries.
-- The protocol layer is tested with **synthetic and captured buffers** — no hardware
+- The protocol layer is tested with **synthetic and captured buffers**, no hardware
   required. `crc16`, `parseCodec8Packet` and `command-encoder` are pure functions; keep real
   hex dumps as fixtures and assert byte offsets against them, so a firmware or model
   difference shows up as a failing test rather than a misread coordinate.
@@ -433,8 +500,14 @@ Expected variables:
   clearing arrears while the tracker is offline (desired flips, confirmed state unchanged,
   command on reconnect); and running the reconciler twice with no state change (no second
   command).
-- E2E tests in `test/` run against a **dedicated test database** — never the development
-  one — provisioned with `prisma migrate deploy` and truncated between tests.
+- Auth gets tests for what it must refuse, not only what it allows: wrong password, unknown
+  email, deactivated account, identical failure messages, a hash verification on the
+  unknown-email path, no token issued on failure, and a tampered signature rejected. When
+  tampering with a token in a test, alter a character in the **middle** of the signature: the
+  final base64url character of an RSA signature carries unused bits, so changing it can
+  decode to the same signature and the test will pass a token that was never really modified.
+- E2E tests in `test/` run against a **dedicated test database**, never the development
+  one, provisioned with `prisma migrate deploy` and truncated between tests.
 
 ## Conventions
 
@@ -442,6 +515,22 @@ Expected variables:
 - New feature module → generate with `npx nest g module <name>` /`g controller` /
   `g service` so it matches the framework's expected wiring.
 - Errors thrown from services are Nest HTTP exceptions (`NotFoundException`,
-  `ConflictException`, …); do not let raw Prisma errors reach the client — a
+  `ConflictException`, …); do not let raw Prisma errors reach the client, a
   `PrismaClientKnownRequestError` filter maps `P2002` → 409 and `P2025` → 404.
 - Migration names describe the change (`add_contract_payment_schedule`), not the ticket.
+
+@architecture.md
+
+## Commit & PR rules
+
+- **Never** add any mention of Claude, AI, or co-authorship to git commits or
+  pull requests. No `Co-Authored-By: Claude …` trailer, no "Generated with
+  Claude Code" line, no AI attribution anywhere in commit messages or PR bodies.
+  Write commit/PR text as a normal human author would.
+
+
+## Writing style
+
+- **Never** use em dashes (the `-` character) anywhere: not in commit messages,
+  PR titles or bodies, code comments, documentation, or chat replies. Use commas,
+  parentheses, colons, or separate sentences instead.

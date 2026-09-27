@@ -2,7 +2,7 @@ import { StaffRole } from '../../generated/prisma/enums';
 
 /**
  * Back-office staff roles, re-exported from the Prisma enum so there is exactly one
- * definition. Customers are NOT a role here — they are a separate model with their own
+ * definition. Customers are NOT a role here, they are a separate model with their own
  * authentication path (see CLAUDE.md).
  */
 export { StaffRole };

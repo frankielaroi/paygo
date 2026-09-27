@@ -22,7 +22,7 @@ import {
  * auth layer has already put the principal on the request.
  *
  * This guard proves only that the caller's ROLE allows the operation. It never proves the
- * record belongs to them — ownership (e.g. a field agent's own customers) is checked in
+ * record belongs to them, ownership (e.g. a field agent's own customers) is checked in
  * the service against the resource (see CLAUDE.md).
  */
 @Injectable()

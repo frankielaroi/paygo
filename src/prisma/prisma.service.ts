@@ -9,7 +9,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../generated/prisma/client';
 
 /**
- * The data-access layer. Services inject this directly — there is no repository
+ * The data-access layer. Services inject this directly, there is no repository
  * wrapper around Prisma (see CLAUDE.md).
  *
  * Prisma 7 connects through a driver adapter, so the connection string is read here via
