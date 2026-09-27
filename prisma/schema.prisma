@@ -1,0 +1,149 @@
+// PayGo — pay-as-you-go motorbike financing.
+// See CLAUDE.md for the conventions this schema follows. The most important one:
+// `User` (staff) and `Customer` (rider) are deliberately separate models. Do not merge
+// them into one table with a role column, and do not add a customer value to StaffRole.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// RBAC
+// ---------------------------------------------------------------------------
+
+/// Back-office staff roles. Customers are NOT a role here — they are a separate
+/// model with their own identity and authentication path.
+enum StaffRole {
+  ADMIN
+  FIELD_AGENT
+}
+
+// ---------------------------------------------------------------------------
+// Staff
+// ---------------------------------------------------------------------------
+
+/// Staff who sign in to the back office. Never holds customers.
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  phone        String?   @unique
+  role         StaffRole
+  branch       String?
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+
+  /// Self-relation: the agent's supervisor.
+  supervisorId String? @db.Uuid
+  supervisor   User?   @relation("StaffSupervision", fields: [supervisorId], references: [id], onDelete: SetNull)
+  subordinates User[]  @relation("StaffSupervision")
+
+  /// Customers this agent currently owns. Drives the "an agent may not touch
+  /// another agent's customers" boundary — enforced in the service, not just the guard.
+  assignedCustomers    Customer[] @relation("CustomerAssignedAgent")
+  registeredCustomers  Customer[] @relation("CustomerRegisteredBy")
+  kycVerifiedCustomers Customer[] @relation("CustomerKycVerifiedBy")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([role])
+  @@index([supervisorId])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Customers (riders)
+// ---------------------------------------------------------------------------
+
+enum CustomerStatus {
+  PENDING_KYC
+  ACTIVE
+  SUSPENDED
+  DEFAULTED
+  CLOSED
+}
+
+/// A rider being financed. Identity is the phone number — a field agent registers
+/// them, and many never sign in at all. `passwordHash` is deliberately absent: if a
+/// rider app ships, it authenticates by phone + OTP on its own path.
+model Customer {
+  id     String         @id @default(uuid()) @db.Uuid
+  status CustomerStatus @default(PENDING_KYC)
+
+  // Identity
+  phone           String    @unique
+  alternatePhone  String?
+  phoneVerifiedAt DateTime?
+
+  firstName String
+  lastName  String
+
+  // KYC
+  nationalId    String    @unique
+  photoUrl      String?
+  idDocumentUrl String?
+  dateOfBirth   DateTime? @db.Date
+  kycVerifiedAt DateTime?
+
+  kycVerifiedById String? @db.Uuid
+  kycVerifiedBy   User?   @relation("CustomerKycVerifiedBy", fields: [kycVerifiedById], references: [id], onDelete: SetNull)
+
+  // Address
+  addressLine String?
+  ward        String?
+  district    String?
+  region      String?
+
+  // Ownership. Registration is historical fact and never changes; assignment moves
+  // when a customer is handed to another agent.
+  registeredById String @db.Uuid
+  registeredBy   User   @relation("CustomerRegisteredBy", fields: [registeredById], references: [id])
+
+  assignedAgentId String? @db.Uuid
+  assignedAgent   User?   @relation("CustomerAssignedAgent", fields: [assignedAgentId], references: [id], onDelete: SetNull)
+
+  contacts CustomerContact[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([assignedAgentId])
+  @@index([status])
+  @@map("customers")
+}
+
+enum ContactType {
+  GUARANTOR
+  NEXT_OF_KIN
+}
+
+/// Guarantors and next of kin. One model because the fields are identical and the
+/// only difference is what the person is on the hook for.
+model CustomerContact {
+  id   String      @id @default(uuid()) @db.Uuid
+  type ContactType
+
+  firstName    String
+  lastName     String
+  phone        String
+  relationship String?
+  nationalId   String?
+  addressLine  String?
+
+  customerId String   @db.Uuid
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId, type])
+  @@map("customer_contacts")
+}

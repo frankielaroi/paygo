@@ -11,11 +11,18 @@ in proportion to what they have paid.
 Financed assets are GPS-tracked and can be **remotely immobilized** when a contract falls
 into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* below).
 
-The repository is currently a **bare NestJS starter** — `src/` contains only
-`main.ts`, `app.module.ts`, `app.controller.ts` and `app.service.ts`. Prisma, Postgres,
-auth, Redis, Docker and the `src/tcp/` device module are **not installed yet**.
+**Built so far:** Prisma 7 + Postgres wiring (`src/prisma/`), the `User` (staff) and
+`Customer` (rider) models with `CustomerContact`, and the RBAC layer — `StaffRole`, the
+permission map in `src/users/enums/role.enum.ts`, `@Roles`/`@RequirePermissions`/`@Public`/
+`@CurrentUser`, and `RolesGuard`. One migration is applied:
+`init_users_customers_rbac`.
 
-Everything below the "Architecture" heading describes the **target architecture and the
+**Not built yet:** authentication itself (no `auth/` module, no `JwtAuthGuard`, nothing
+populates `request.user`, and `User.passwordHash` is never written), plans, contracts,
+payments, ledger, positions, enforcement, the `src/tcp/` device module, Redis/BullMQ, and
+Swagger.
+
+Everything below describing those unbuilt pieces is the **target architecture and the
 conventions to follow when adding code**, not files that already exist. When implementing a
 feature, create the structure described here rather than inventing a new one. Do not cite
 paths from this document as if they were already present — check first.
@@ -57,21 +64,26 @@ is a lint error. Run both before considering a change done.
 
 ### Database (Prisma)
 
-These are the commands to use once Prisma is installed. Prefer the raw `npx prisma`
-form — the `npm run` aliases below are the ones this project should add to `package.json`,
-but they may not exist yet.
-
 ```bash
-npx prisma migrate dev --name add_payment_plans   # create + apply a migration in dev
-npx prisma migrate deploy                         # apply pending migrations (CI/prod)
-npx prisma migrate reset                          # drop, recreate, re-seed (DEV ONLY)
-npx prisma generate                               # regenerate the client after schema edits
-npx prisma studio                                 # browse data
-npx prisma db seed                                # run prisma/seed.ts
+npm run migration:dev -- --name add_payment_plans  # create + apply a migration in dev
+npm run migration:deploy                           # apply pending migrations (CI/prod)
+npm run db:reset                                   # drop, recreate (DEV ONLY)
+npm run prisma:generate                            # regenerate the client after schema edits
+npm run db:studio                                  # browse data
 ```
 
-Suggested `package.json` scripts: `prisma:generate`, `migration:dev`, `migration:deploy`,
-`db:reset`, `db:seed`, `db:studio`.
+**This project runs Prisma 7**, which differs from most Prisma material online:
+
+- The generator is `prisma-client` (not `prisma-client-js`) and emits **TypeScript sources**
+  to `src/generated/prisma`, which is git-ignored and excluded from ESLint and Prettier.
+  Import from `../generated/prisma/client`; enums come from `../generated/prisma/enums`.
+- The output lives under `src/` on purpose. Outside it, `tsc` widens the rootDir and the
+  build emits `dist/src/main.js`, breaking `npm run start:prod`.
+- **A driver adapter is required** — there is no `datasourceUrl` or `datasources` option.
+  `PrismaService` constructs `new PrismaPg({ connectionString })` from `@prisma/adapter-pg`.
+- Connection config lives in `prisma7.config.ts`, and `datasource db` in the schema has no
+  `url`. The Prisma CLI does **not** auto-load `.env`; `prisma7.config.ts` does it via
+  `import "dotenv/config"`.
 
 **Rules:**
 
@@ -126,15 +138,17 @@ src/
     auth.controller.ts
     strategy/jwt.strategy.ts
     dto/
-  users/                   # ALL people: admins, field agents, customers — one table,
-    enums/role.enum.ts     #   separated by role, not by module
+  users/                   # STAFF ONLY: admins + field agents. Authenticates to back office
+    enums/role.enum.ts
+  customers/               # riders being financed. KYC, guarantors. NOT in users (see below)
   assets/                  # financed motorbikes: identity, GPS device, state
   plans/                   # financing plans: price, deposit, tenor, rate
   contracts/               # a customer's plan on a motorbike; payment schedule
   payments/                # inbound payments, provider webhooks, allocation
   ledger/                  # append-only double-entry account movements
   positions/               # telemetry persistence: GPS fixes, ignition, movement
-  enforcement/             # arrears -> immobilize/restore decisions + safety interlock
+  enforcement/             # desired mobility state, arrears rules, safety interlock
+    reconciler.service.ts  #   desired vs confirmed state -> command, when safe
   tcp/                     # raw TCP device protocol (see Device Telemetry)
     tcp.module.ts
     tcp-server.service.ts  # net.Server: IMEI handshake, socket map, ACKs, sendCommand
@@ -160,6 +174,22 @@ src/
   read paths that return lists.
 - Never interpolate user input into `$queryRawUnsafe`. Use `$queryRaw` with tagged
   template parameters if raw SQL is genuinely needed.
+
+**`User` and `Customer` are deliberately separate models.** `User` is staff who sign into the
+back office (admin, field agent). `Customer` is the rider being financed. Do not merge them
+into one table with a role column, and do not add a `CUSTOMER` value to the staff role enum.
+
+- It is a security boundary, not tidiness. With one table, role assignment is the only thing
+  between a rider and admin — a default-value bug, a mass-assignment slip, or a seeded test
+  row becomes privilege escalation. Separate models make that unrepresentable.
+- The records share almost no columns. Customers carry KYC (national ID, photo, address,
+  guarantors, next of kin); staff carry branch and supervisor. Merged, every one of those is
+  nullable and every query is filtered by role.
+- Customer identity is a **phone number**, not an email and password — a field agent
+  registers them, and many never sign in at all. If a rider app ships later, give `Customer`
+  its own phone/OTP credential rather than moving riders into `users`.
+- `contract.customerId`, ledger rows and audit records all point at `Customer`. Changing
+  this later is a migration across financial history, so it does not get revisited casually.
 
 ### Money and Financial Correctness
 
@@ -221,14 +251,54 @@ Protocol flow: device opens a socket → IMEI handshake → `TcpServerService` k
 - `sendCommand(imei, 'immobilize' | 'restore')` **fires immediately and unconditionally**.
   It does not check speed, ignition, or anything else.
 - **The safety interlock lives in `enforcement/`, never in `tcp/`.** Before any
-  `immobilize` call, the enforcement service must confirm from persisted telemetry that the
-  asset is stationary — speed == 0 **and** ignition off, sustained for a configured number
-  of seconds — plus that the contract is genuinely in arrears. Immobilizing a moving
-  vehicle can kill someone. Do not add a convenience path that reaches `sendCommand`
-  without passing that check, and do not "temporarily" bypass it for testing against a
-  live device.
+  `immobilize` call, the reconciler must confirm from persisted telemetry that the asset is
+  stationary — speed == 0 **and** ignition off, sustained for
+  `IMMOBILIZE_STATIONARY_SECONDS` — plus that the contract is genuinely in arrears.
+  Immobilizing a moving vehicle can kill someone. Do not add a convenience path that reaches
+  `sendCommand` without passing that check, and do not "temporarily" bypass it for testing
+  against a live device.
 - Every immobilize/restore is audit-logged: who or what triggered it, the contract, the
   telemetry snapshot the interlock relied on, and the device's response.
+
+### Enforcement: Desired State, Not Commands
+
+Enforcement is a **reconciler**, not a command sender. Each asset stores a desired mobility
+state (`MOBILE` / `IMMOBILIZED`) plus the last **device-confirmed** state. Nothing outside
+`enforcement/` calls `sendCommand`.
+
+- Enforcement rules (arrears, payment, admin action) only ever **write desired state**.
+- The reconciler compares desired against confirmed and emits a command when they diverge
+  *and* it is safe right now. It runs on device handshake, on telemetry arrival, and on a
+  timer.
+- Confirmed state advances only on the device's response or subsequent telemetry — **never**
+  on a successful `write()`.
+
+**Why not a pending-command queue.** A device reconnecting is usually a device that was just
+powered on or just regained signal *while being ridden*. Draining a queued immobilize at
+handshake therefore fires at a moving motorbike: the offline case and the most dangerous case
+are the same case. Converging on desired state also removes stale-intent expiry, the ordering
+problem when immobilize and restore are both pending (latest desired state simply wins), and
+double-execution on retry, because convergence is idempotent where command replay is not.
+
+**Restore is asymmetric with immobilize and must stay that way.** Immobilize needs the
+interlock because it can kill someone; restore cannot hurt anyone. Restore is therefore
+automatic and ungated — it fires immediately, including the moment an offline tracker
+reconnects. A rider who has paid must not be stranded waiting for someone to click a button;
+that is their day's income.
+
+- **Restore triggers on "contract became current", not "payment received."** The decision
+  reads the derived ledger balance inside the same transaction that posts the payment
+  entries. Triggering off the webhook would let a token payment unlock a bike that is months
+  down — and triggering off the balance means arrears cleared by an admin adjustment,
+  write-off or restructure restores the bike too, which is correct.
+- The "current enough to restore" threshold is **configuration**, not a literal in the
+  service: fully current, within a grace amount, or one installment behind. It will be tuned.
+- Immobilize, by contrast, typically does *not* fire at handshake. It waits for the next
+  confirmed stationary moment.
+
+Because desired state is a single mutable field, keep an **append-only log of desired-state
+changes** — actor, contract, arrears snapshot, and the telemetry the interlock relied on.
+That log is what answers a rider disputing an immobilization.
 
 **Telemetry ingestion:**
 
@@ -264,16 +334,28 @@ concurrent-device count before trusting it at fleet scale.
   `PUBLIC_KEY` verifies; keys come from the environment and are never committed.
 - `JwtStrategy` in `src/auth/strategy/jwt.strategy.ts` validates the token and resolves
   the user; `JwtAuthGuard` is registered globally, with `@Public()` opting an endpoint out.
-- RBAC: roles enumerated in `src/users/enums/role.enum.ts`, applied with `@Roles(...)` and
-  enforced by `RolesGuard`. There is **one `users` table** holding admins, field agents and
-  customers, distinguished by role — not one module or table per kind of person. The roles
-  are **admin**, **field agent**, and **customer (rider)**.
-- Role boundaries that matter: a field agent must not read or move money belonging to
-  another agent's customers; a customer sees only their own contract, payments and bike; and
-  **immobilize/restore is not a field-agent capability by default** — decide that
-  deliberately rather than inheriting it from a broad agent role.
+- RBAC: staff roles enumerated in `src/users/enums/role.enum.ts`, applied with `@Roles(...)`
+  and enforced by `RolesGuard`. The staff roles are **admin** and **field agent**. Customers
+  are a separate model and are **not** a role in this enum — see *Database* above.
+- Role boundaries that matter: a field agent must not read or move money belonging to another
+  agent's customers, and **immobilize/restore is not a field-agent capability by default** —
+  an agent in the field is the most likely person to want that button and the least able to
+  verify the bike is stopped. Grant it deliberately or not at all.
+- If a rider-facing API ships, it authenticates `Customer` (phone/OTP) on its own path and
+  issues tokens that the staff guards do not accept. A customer sees only their own contract,
+  payments and bike.
 - Authorization is checked in the service against the resource's owner, not only by role
-  in the guard. Role alone never proves the record belongs to the caller.
+  in the guard. Role alone never proves the record belongs to the caller. For customers that
+  means comparing against `Customer.assignedAgentId`.
+- Capabilities live in the **permission map** in `src/users/enums/role.enum.ts`, not in
+  database tables — with two fixed roles, a permissions table would be a join on every
+  request and a migration for every change. Prefer `@RequirePermissions(...)` over
+  `@Roles(...)` on routes, so adding a role does not mean revisiting every controller. Move
+  the map into the database only when admins need to edit roles at runtime.
+- The principal type `AuthenticatedStaff` carries an explicit `kind: 'staff'`, and
+  `RolesGuard` rejects anything else. When customer auth ships, a rider token must not
+  satisfy a staff route just because it carries an id — the guard must never resolve a
+  subject without checking which kind it is.
 - Password hashing with argon2 or bcrypt. Never log tokens, keys, password hashes, or
   full payment payloads.
 
@@ -326,6 +408,7 @@ Expected variables:
 | `REDIS_HOST` / `REDIS_PORT` | BullMQ connection |
 | `TCP_DEVICE_PORT` | Raw TCP listener for Teltonika devices (default 5027) |
 | `IMMOBILIZE_STATIONARY_SECONDS` | Interlock: how long an asset must be stopped first |
+| `RESTORE_ARREARS_THRESHOLD` | How current a contract must be to auto-restore mobility |
 
 ### Testing Strategy
 
@@ -344,6 +427,12 @@ Expected variables:
 - The interlock gets its own tests, written as denials: moving asset → no command sent;
   ignition on → no command sent; stationary but not yet sustained → no command sent;
   contract current → no command sent. Assert `sendCommand` was *not* called.
+- The reconciler gets tests for the cases that only appear over time: a device reconnecting
+  while moving with `IMMOBILIZED` desired (no command, then a command once stationary
+  telemetry arrives); desired `MOBILE` on reconnect (command sent immediately); a payment
+  clearing arrears while the tracker is offline (desired flips, confirmed state unchanged,
+  command on reconnect); and running the reconciler twice with no state change (no second
+  command).
 - E2E tests in `test/` run against a **dedicated test database** — never the development
   one — provisioned with `prisma migrate deploy` and truncated between tests.
 
