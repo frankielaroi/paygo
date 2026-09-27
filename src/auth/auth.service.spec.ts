@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { AuthService } from './auth.service';
 import { PasswordService } from './password.service';
+import { RefreshTokenService } from './refresh-token.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StaffRole } from '../users/enums/role.enum';
 
@@ -40,16 +41,26 @@ function build(
     signAsync: jest.fn().mockResolvedValue('signed.jwt.token'),
   } as unknown as JwtService;
 
+  const refreshTokens = {
+    issue: jest.fn().mockResolvedValue({
+      token: 'refresh-token',
+      expiresAt: new Date('2026-01-01T00:00:00.000Z'),
+    }),
+    rotate: jest.fn(),
+    revoke: jest.fn(),
+  } as unknown as RefreshTokenService;
+
   const config = {
     getOrThrow: jest.fn(),
     get: jest.fn().mockReturnValue('15m'),
   } as unknown as ConfigService;
 
   return {
-    service: new AuthService(prisma, jwt, passwords, config),
+    service: new AuthService(prisma, jwt, passwords, refreshTokens, config),
     prisma,
     passwords,
     jwt,
+    refreshTokens,
   };
 }
 

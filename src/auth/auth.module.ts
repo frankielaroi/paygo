@@ -5,6 +5,7 @@ import { PassportModule } from '@nestjs/passport';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { PasswordService } from './password.service';
+import { RefreshTokenService } from './refresh-token.service';
 import { JwtStrategy } from './strategy/jwt.strategy';
 import { jwtKeyConfig } from '../config/jwt.config';
 
@@ -28,7 +29,7 @@ import { jwtKeyConfig } from '../config/jwt.config';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, PasswordService, JwtStrategy],
-  exports: [AuthService, PasswordService],
+  providers: [AuthService, PasswordService, RefreshTokenService, JwtStrategy],
+  exports: [AuthService, PasswordService, RefreshTokenService],
 })
 export class AuthModule {}

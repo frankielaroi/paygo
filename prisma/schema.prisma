@@ -40,6 +40,12 @@ model User {
   isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
 
+  /// Per-account brute force protection, independent of the IP rate limit. Reset on a
+  /// successful login. Short lockouts on purpose: a long one lets an attacker who knows an
+  /// admin's email lock them out at will.
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+
   /// Self-relation: the agent's supervisor.
   supervisorId String? @db.Uuid
   supervisor   User?   @relation("StaffSupervision", fields: [supervisorId], references: [id], onDelete: SetNull)
@@ -51,12 +57,42 @@ model User {
   registeredCustomers  Customer[] @relation("CustomerRegisteredBy")
   kycVerifiedCustomers Customer[] @relation("CustomerKycVerifiedBy")
 
+  refreshTokens RefreshToken[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([role])
   @@index([supervisorId])
   @@map("users")
+}
+
+/// A refresh token, stored only as a SHA-256 hash: the database must not contain anything
+/// that can be replayed if it leaks. Opaque random bytes rather than a JWT, so revoking one
+/// is a row update instead of a blocklist.
+model RefreshToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  tokenHash String   @unique
+  expiresAt DateTime
+
+  /// Set when the token is used (rotated) or explicitly logged out. A presented token that
+  /// is already revoked means the token leaked, and the whole family is then revoked.
+  revokedAt    DateTime?
+  /// The token issued in this one's place, so a reuse can be traced through the chain.
+  replacedById String?   @db.Uuid
+
+  /// Recorded for audit, never trusted for authorization.
+  userAgent String?
+  ipAddress String?
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
 }
 
 // ---------------------------------------------------------------------------
