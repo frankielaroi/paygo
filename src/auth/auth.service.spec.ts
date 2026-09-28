@@ -5,6 +5,7 @@ import { AuthService } from './auth.service';
 import { PasswordService } from './password.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { PrismaService } from '../prisma/prisma.service';
+import type { Env } from '../config/env.validation';
 import { StaffRole } from '../users/enums/role.enum';
 
 const activeAdmin = {
@@ -63,7 +64,7 @@ function build(
     // Keyed, not a single return value: the lockout maths compares against numbers, and a
     // blanket '15m' would make `attempts >= maxAttempts` silently false forever.
     get: jest.fn((key: string) => CONFIG_VALUES[key]),
-  } as unknown as ConfigService;
+  } as unknown as ConfigService<Env, true>;
 
   return {
     service: new AuthService(prisma, jwt, passwords, refreshTokens, config),

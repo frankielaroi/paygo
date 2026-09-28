@@ -60,12 +60,17 @@ npm run build          # nest build
 ### Testing
 
 ```bash
-npm test                                  # all unit tests
+npm test                                  # unit tests under src/
 npm test -- src/auth/auth.service.spec.ts # a single test file
+npm run test:tools                        # the device simulator's own tests
+npm run test:e2e                          # uses test/jest-e2e.json
+npm run test:all                          # unit, tools and e2e in sequence
 npm run test:watch
 npm run test:cov                          # coverage -> ./coverage
-npm run test:e2e                          # uses test/jest-e2e.json
 ```
+
+Three suites, three configs. `npm test` covers `src/` only, so a change to `tools/` needs
+`npm run test:tools`, and CI should run `npm run test:all`.
 
 Jest config lives inline in `package.json` with `rootDir: "src"` and
 `testRegex: ".*\\.spec\\.ts$"`, so unit tests must sit **next to the source file** they
@@ -113,7 +118,10 @@ npm run db:studio                                  # browse data
   to `src/generated/prisma`, which is git-ignored and excluded from ESLint and Prettier.
   Import from `../generated/prisma/client`; enums come from `../generated/prisma/enums`.
 - The output lives under `src/` on purpose. Outside it, `tsc` widens the rootDir and the
-  build emits `dist/src/main.js`, breaking `npm run start:prod`.
+  build emits `dist/src/main.js`, breaking `npm run start:prod`. For the same reason
+  `tsconfig.build.json` excludes `tools`, `prisma` and `prisma7.config.ts`: any `.ts` file outside
+  `src/` that the build compiles moves `main.js` and breaks production start. Check
+  `ls dist/main.js` after adding top-level TypeScript.
 - **A driver adapter is required**, there is no `datasourceUrl` or `datasources` option.
   `PrismaService` constructs `new PrismaPg({ connectionString })` from `@prisma/adapter-pg`.
 - Connection config lives in `prisma7.config.ts`, and `datasource db` in the schema has no
@@ -372,11 +380,36 @@ Files: `crc16.ts`, `codec8-parser.ts` (framing, records, handshake), `command-en
   agree with itself and every test would pass. `crc16.spec.ts` anchors both by pinning the real
   CRC against published CRC-16/ARC vectors. It is named `codec8-fixtures.ts`, not `.spec.ts`, so
   Jest does not treat it as a suite.
-- `tools/fake-device/` is a full device simulator (`npm run simulator`, with `stationary`,
-  `moving`, `idle`, `abrupt-disconnect`, `corrupt-crc`, `corrupt-data` scenarios and
-  `--devices N`) for driving a **running** server. It is currently git-ignored, so the committed
-  test suite must not import it: a spec that did would fail on a fresh clone. Use it manually,
-  keep the automated specs on the fixture.
+- `tools/fake-device/` is a full device simulator for driving a **running** server
+  (`npm run simulator -- --help`). Its own tests run under `npm run test:tools`, which needs a
+  separate Jest config because the main one has `rootDir: src` and would otherwise skip them
+  silently.
+- **`src/` must never import from `tools/`.** `tools` is excluded from `tsconfig.build.json`, so a
+  production build would either fail to resolve the import or drag the tool into `dist`. That is
+  the second reason the specs use the fixture rather than the simulator's encoder.
+
+**The simulator (`tools/fake-device/`).** It is a test instrument, so it is held to the same
+standard as the app: linted, formatted, type-checked and tested.
+
+- Scenarios: `stationary`, `moving`, `idle`, `abrupt-disconnect`, `corrupt-crc`, `corrupt-data`,
+  `reconnect` (drops, comes back, delivers what it stored) and `split-writes` (each packet written
+  in two chunks). `--devices N` runs a small fleet with distinct IMEIs.
+- **It honours acknowledgements.** Records stay in a queue until the server acknowledges the exact
+  count that was sent. A mismatched or missing ACK means retransmission, which is what makes the
+  server's "never acknowledge a corrupt packet" rule observable: refuse one and the device sends it
+  again rather than losing it.
+- **It buffers while offline.** With no connection, cycles keep queueing records up to
+  `--store N`, then drop the oldest as a real unit with finite memory does. On reconnect the
+  backlog goes out, batched up to `--batch N`. This is the case enforcement has to handle: a
+  decision made while a device was away must be reconciled against the telemetry that arrives when
+  it returns.
+- **It retries on ACK timeout.** Without that it would wait forever for a server that never
+  answered, which is the one failure a test instrument must not hide. Two tests deadlocked before
+  this existed, which is how it was found.
+- Its tests run against a **minimal stub server**, not against `TcpServerService`. An instrument
+  has to be trustworthy independently of the thing it measures; testing them against each other
+  would make a shared misreading of the protocol look like agreement.
+- Negative CLI numbers need the equals form (`--lat=-1.30`), since a leading dash parses as a flag.
 
 `tcp-server.service.spec.ts` drives the real service over loopback sockets rather than a mocked
 socket, because framing bugs only appear when bytes actually arrive split or back to back.

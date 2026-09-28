@@ -232,7 +232,7 @@ describe('RefreshTokenService', () => {
       userAgent: 'x'.repeat(5000),
       ipAddress: '1.2.3.4',
     });
-    const created = tx.refreshToken.create.mock.calls[0][0] as {
+    const created = tx.refreshToken.create.mock.calls[0][0] as unknown as {
       data: { userAgent: string };
     };
 

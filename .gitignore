@@ -64,10 +64,3 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 /.windsurf
 skills-lock.json
 
-/fake-device
-tools/fake-device/fake-device.ts
-tools/fake-device/codec8-builder.ts
-tools/fake-device/codec8-builder.spec.ts
-tools/fake-device/cli.ts
-tools/fake-device/crc16.ts
-tools/fake-device/index.ts
