@@ -27,11 +27,19 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
 - Swagger at `/api` (JSON at `/api-json`), configured in `src/config/swagger.ts`.
 - An admin seed (`npm run db:seed`), idempotent on email and never overwriting an existing
   user's password.
+- The device protocol layer (`src/tcp/`): Codec 8 parser, Codec 12 command encoder, CRC-16, and
+  `TcpServerService` (IMEI handshake, socket map, framing, ACKs, `sendCommand`). It emits
+  `device.connected`, `device.disconnected`, `device.positions` and `device.command-response`
+  through `EventEmitterModule`, and persists nothing.
 
-**Not built yet:** plans, contracts, payments, ledger, positions, enforcement, the
-`src/tcp/` device module, Redis/BullMQ, customer (rider) authentication, revoking sessions on
-password change (`RefreshTokenService.revokeAllForUser` exists but nothing calls it), and a
-job to delete expired refresh token rows.
+**Not built yet:** plans, contracts, payments, ledger, positions, enforcement, Redis/BullMQ,
+customer (rider) authentication, revoking sessions on password change
+(`RefreshTokenService.revokeAllForUser` exists but nothing calls it), and a job to delete
+expired refresh token rows.
+
+**Nothing listens to the device events yet.** `src/tcp/` emits positions and nobody subscribes,
+so telemetry is decoded and discarded. The next piece is `positions/` persisting
+`device.positions`, which is also what proves the decoupling works end to end.
 
 Everything below describing those unbuilt pieces is the **target architecture and the
 conventions to follow when adding code**, not files that already exist. When implementing a
@@ -318,6 +326,65 @@ Protocol flow: device opens a socket → IMEI handshake → `TcpServerService` k
 - Every immobilize/restore is audit-logged: who or what triggered it, the contract, the
   telemetry snapshot the interlock relied on, and the device's response.
 
+### What `src/tcp/` actually does, as built
+
+Files: `crc16.ts`, `codec8-parser.ts` (framing, records, handshake), `command-encoder.ts`,
+`tcp-server.service.ts`, `tcp.events.ts`, `tcp.module.ts`.
+
+- **Parsing is pure and never throws.** `parseFrame` returns a tagged result: `incomplete` (wait
+  for more bytes), `records`, `command-response`, `invalid` (framed but unusable: skip this frame
+  and carry on), or `unrecoverable` (the stream cannot be resynchronised: close the connection).
+  Every result that consumed bytes reports how many, and the caller slices exactly that much.
+- **Bad CRC is deliberately not acknowledged.** The device keeps the records and resends, which
+  is what makes weak-signal data recoverable. Acknowledging a corrupt packet loses it silently.
+- **A record must exactly fill its packet.** The leading and trailing record counts must agree
+  and the parsed records must end where the trailing count begins. Both checks exist because a
+  misread IO layout still produces plausible coordinates, which is worse than an error.
+- **`satellites === 0` sets `hasFix: false`.** Teltonika sends 0/0 coordinates with no fix, and
+  storing that as a position puts the bike in the Gulf of Guinea. An interlock reading it as
+  "stationary" would be reading nothing at all.
+- **Codec 8 Extended (0x8e) is refused, not guessed at.** It uses 2-byte IO ids and counts.
+  Configure devices for plain Codec 8, or implement 8E properly first.
+- **`ignition` and `movement` are `boolean | null`.** Null means the device did not report the
+  property, which is not the same as off. An interlock must treat null as unknown, not as safe.
+- **Every socket is tracked, not only handshaken ones.** `server.close()` waits for open
+  connections, so a device that connects and never identifies itself would hang shutdown
+  forever. This was a real bug, caught by a test that closed the server with such a connection
+  open.
+- **A close only deregisters the IMEI if it still points at that socket.** Otherwise the close
+  event of an already-replaced socket deletes the live entry and the device looks offline while
+  it is not.
+- **`sendCommand` returns a result, never throws.** `{ delivered: false, reason: 'not-connected' }`
+  is a first-class outcome, because the caller must be able to tell "the device refused" from
+  "the device was unreachable". A successful write is not confirmation: that comes from the
+  `device.command-response` event or later telemetry.
+- **Which digital output value immobilizes depends on the wiring, not the protocol.**
+  `command-encoder.ts` maps immobilize to `setdigout 1` and restore to `setdigout 0`, matching
+  the simulator. With a normally-closed relay the meaning inverts, and shipping it backwards
+  means "immobilize" starts a bike and "restore" strands a rider. Verify on a bench relay before
+  any vehicle.
+
+**Testing it without hardware, at two levels.**
+
+- `src/tcp/codec8-fixtures.ts` builds packets for the specs. It is a **separate encoder with its
+  own CRC loop**, never an import of `crc16.ts`, so the parser is checked against bytes it did not
+  produce. If the builder and the parser shared code, a misreading of the Teltonika spec would
+  agree with itself and every test would pass. `crc16.spec.ts` anchors both by pinning the real
+  CRC against published CRC-16/ARC vectors. It is named `codec8-fixtures.ts`, not `.spec.ts`, so
+  Jest does not treat it as a suite.
+- `tools/fake-device/` is a full device simulator (`npm run simulator`, with `stationary`,
+  `moving`, `idle`, `abrupt-disconnect`, `corrupt-crc`, `corrupt-data` scenarios and
+  `--devices N`) for driving a **running** server. It is currently git-ignored, so the committed
+  test suite must not import it: a spec that did would fail on a fresh clone. Use it manually,
+  keep the automated specs on the fixture.
+
+`tcp-server.service.spec.ts` drives the real service over loopback sockets rather than a mocked
+socket, because framing bugs only appear when bytes actually arrive split or back to back.
+
+**`TCP_DEVICE_ENABLED=false` is set for `npm run test:e2e`.** Otherwise both e2e suites boot
+`AppModule` in parallel and fight over port 5027. `listen(0)` picks an ephemeral port and
+`port()` reports it, which is how the integration spec avoids the same clash.
+
 ### Enforcement: Desired State, Not Commands
 
 Enforcement is a **reconciler**, not a command sender. Each asset stores a desired mobility
@@ -552,6 +619,7 @@ Expected variables:
 | `LOGIN_RATE_LIMIT` / `LOGIN_RATE_WINDOW_SECONDS` | Per-IP limit on credential endpoints |
 | `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` | Used only by `npm run db:seed` |
 | `REDIS_HOST` / `REDIS_PORT` | BullMQ connection |
+| `TCP_DEVICE_ENABLED` | `false` disables the device listener (set for e2e runs) |
 | `TCP_DEVICE_PORT` | Raw TCP listener for Teltonika devices (default 5027) |
 | `IMMOBILIZE_STATIONARY_SECONDS` | Interlock: how long an asset must be stopped first |
 | `RESTORE_ARREARS_THRESHOLD` | How current a contract must be to auto-restore mobility |

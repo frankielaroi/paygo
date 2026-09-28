@@ -78,6 +78,14 @@ export const envSchema = z.object({
   LOGIN_RATE_LIMIT: z.coerce.number().int().positive().default(10),
   LOGIN_RATE_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
 
+  // Device TCP listener. Disabled in tests unless a spec turns it on with port 0, so a test run
+  // does not fight the dev server for the port.
+  TCP_DEVICE_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  TCP_DEVICE_PORT: port.default(5027),
+
   SWAGGER_ENABLED: z
     .enum(['true', 'false'])
     .default('false')

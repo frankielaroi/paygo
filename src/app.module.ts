@@ -7,7 +7,9 @@ import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { PrismaModule } from './prisma/prisma.module';
+import { TcpModule } from './tcp/tcp.module';
 import { type Env, validateEnv } from './config/env.validation';
 
 @Module({
@@ -35,8 +37,10 @@ import { type Env, validateEnv } from './config/env.validation';
         ],
       }),
     }),
+    EventEmitterModule.forRoot(),
     PrismaModule,
     AuthModule,
+    TcpModule,
   ],
   controllers: [AppController],
   providers: [
