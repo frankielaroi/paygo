@@ -1,6 +1,10 @@
 import { decodeCommandFrame } from './codec8-fixtures';
 import { parseFrame } from './codec8-parser';
-import { commandText, encodeCommand } from './command-encoder';
+import {
+  commandFromResponse,
+  commandText,
+  encodeCommand,
+} from './command-encoder';
 
 describe('encodeCommand', () => {
   // Decoded by the fixture, which is a separate implementation, so this checks the frame against
@@ -35,5 +39,34 @@ describe('encodeCommand', () => {
 
     expect(frame.readUInt32BE(0)).toBe(0);
     expect(frame.length).toBe(8 + dataLength + 4);
+  });
+});
+
+describe('commandFromResponse', () => {
+  it('reads the state from an echoed setdigout reply', () => {
+    expect(
+      commandFromResponse('Setdigout 1 OK (Relay OFF / Immobilized)'),
+    ).toBe('immobilize');
+    expect(commandFromResponse('Setdigout 0 OK (Relay ON / Restored)')).toBe(
+      'restore',
+    );
+  });
+
+  it('reads the state from an output report', () => {
+    expect(commandFromResponse('DOUT1:1 DOUT2:0 Timeout:INFINITY')).toBe(
+      'immobilize',
+    );
+    expect(commandFromResponse('DOUT1:0 DOUT2:1')).toBe('restore');
+  });
+
+  it('returns null for a reply that does not state DOUT1, never a guess', () => {
+    expect(commandFromResponse('Command executed OK')).toBeNull();
+    expect(commandFromResponse('DOUT2:1')).toBeNull();
+    expect(commandFromResponse('')).toBeNull();
+  });
+
+  it('round-trips every command through the text it sends', () => {
+    expect(commandFromResponse(commandText('immobilize'))).toBe('immobilize');
+    expect(commandFromResponse(commandText('restore'))).toBe('restore');
   });
 });

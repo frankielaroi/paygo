@@ -29,6 +29,29 @@ export function commandText(command: DeviceCommand): string {
   return COMMAND_TEXT[command];
 }
 
+/** The same wiring assumption as COMMAND_TEXT, read in the other direction. */
+const OUTPUT_STATE_COMMAND: Record<'0' | '1', DeviceCommand> = {
+  '1': 'immobilize',
+  '0': 'restore',
+};
+
+/**
+ * Reads which state a device says DOUT1 is now in from its Codec 12 reply, or null when the
+ * reply does not say. Accepts the echoed form ("Setdigout 1 OK", what the simulator sends) and
+ * the output report form ("DOUT1:1 DOUT2:0").
+ *
+ * Null must be treated as unconfirmed, never as success. Response wording varies by model and
+ * firmware: capture the real unit's reply before trusting either pattern.
+ */
+export function commandFromResponse(text: string): DeviceCommand | null {
+  const match =
+    /\bsetdigout\s+([01])/i.exec(text) ??
+    /\bDOUT1\s*[:=]\s*([01])\b/i.exec(text);
+  const value = match?.[1];
+
+  return value === '0' || value === '1' ? OUTPUT_STATE_COMMAND[value] : null;
+}
+
 /**
  * Wraps a GPRS command in a Codec 12 frame:
  * preamble (4, zero) + data length (4) + data field + crc (4), where the data field is

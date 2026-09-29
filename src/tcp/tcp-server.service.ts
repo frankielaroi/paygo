@@ -162,6 +162,11 @@ export class TcpServerService
     return this.connections.has(imei);
   }
 
+  /** When the device's current connection completed its handshake, or null if not connected. */
+  connectedSince(imei: string): Date | null {
+    return this.connections.get(imei)?.connectedAt ?? null;
+  }
+
   /**
    * Writes a command to a device's open socket.
    *
