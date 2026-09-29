@@ -34,8 +34,18 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
 - Tracking (`src/tracking/`): IMEI-to-bike mapping, deduplicated position history, monotonic
   current snapshots, derived online/offline status, authenticated SSE updates, and a typed
   safety snapshot lookup for Enforcement. An admin registers each bike and tracker IMEI.
+- Enforcement core (`src/enforcement/`): per-bike desired vs confirmed mobility state, the
+  reconciler (runs on device connect, committed telemetry, and a timer sweep), the stationary
+  interlock (`interlock.ts`, pure), confirmation from the device's Codec 12 reply only, an
+  append-only `enforcement_events` audit log, a review list for bikes whose telemetry cannot be
+  trusted, and admin manual lock/unlock (`asset:immobilize`).
+  Overdue detection sits behind the `ARREARS_SOURCE` interface; until contracts exist it is
+  bound to `NoArrearsSource`, so the sweep never immobilizes on its own. Payments must call
+  `EnforcementService.applyArrears(bikeId, false, ...)` once the ledger shows a contract
+  current. A staff lock is sticky (arrears and payments never lift it); a staff unlock hands the
+  bike back to arrears control.
 
-**Not built yet:** plans, contracts, payments, ledger, enforcement, Redis/BullMQ,
+**Not built yet:** plans, contracts, payments, ledger, Redis/BullMQ,
 customer (rider) authentication, revoking sessions on password change
 (`RefreshTokenService.revokeAllForUser` exists but nothing calls it), and a job to delete
 expired refresh token rows.
@@ -659,7 +669,10 @@ Expected variables:
 | `TCP_DEVICE_ENABLED` | `false` disables the device listener (set for e2e runs) |
 | `TCP_DEVICE_PORT` | Raw TCP listener for Teltonika devices (default 5027) |
 | `TRACKING_OFFLINE_AFTER_SECONDS` | Quiet period before a bike is reported offline (default 300) |
-| `IMMOBILIZE_STATIONARY_SECONDS` | Interlock: how long an asset must be stopped first |
+| `IMMOBILIZE_STATIONARY_SECONDS` | Interlock: how long an asset must be stopped first (default 120) |
+| `ENFORCEMENT_MAX_TELEMETRY_AGE_SECONDS` | Interlock: oldest reading it will trust (default 300); keep the tracker's on-stop report period below it |
+| `ENFORCEMENT_COMMAND_RETRY_SECONDS` | Wait for a device reply before resending a command (default 300) |
+| `ENFORCEMENT_SWEEP_INTERVAL_SECONDS` | Arrears sweep and retry interval (default 900) |
 | `RESTORE_ARREARS_THRESHOLD` | How current a contract must be to auto-restore mobility |
 
 ### Testing Strategy
