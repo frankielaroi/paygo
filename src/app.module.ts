@@ -14,6 +14,8 @@ import { TrackingModule } from './tracking/tracking.module';
 import { EnforcementModule } from './enforcement/enforcement.module';
 import { AssetsModule } from './assets/assets.module';
 import { CustomersModule } from './customers/customers.module';
+import { LoansModule } from './loans/loans.module';
+import { PaymentsModule } from './payments/payments.module';
 import { type Env, validateEnv } from './config/env.validation';
 
 @Module({
@@ -49,6 +51,8 @@ import { type Env, validateEnv } from './config/env.validation';
     EnforcementModule,
     AssetsModule,
     CustomersModule,
+    LoansModule,
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [

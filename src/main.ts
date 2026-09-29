@@ -4,7 +4,8 @@ import { AppModule } from './app.module';
 import { SWAGGER_PATH, setupSwagger } from './config/swagger';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // rawBody: the Paystack webhook signature is an HMAC over the exact bytes received.
+  const app = await NestFactory.create(AppModule, { rawBody: true });
   const logger = new Logger('Bootstrap');
 
   app.useGlobalPipes(

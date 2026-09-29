@@ -123,6 +123,11 @@ export const envSchema = z.object({
     .max(86400)
     .default(900),
 
+  // Paystack secret key (sk_test_... or sk_live_...). Webhooks are signed with it (HMAC-SHA512
+  // over the raw body). Optional so the app boots without it, but the webhook then refuses
+  // every request: an unverified "payment succeeded" could unlock a bike.
+  PAYSTACK_SECRET_KEY: z.string().min(16).optional(),
+
   SWAGGER_ENABLED: z
     .enum(['true', 'false'])
     .default('false')
