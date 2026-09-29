@@ -12,6 +12,8 @@ import { PrismaModule } from './prisma/prisma.module';
 import { TcpModule } from './tcp/tcp.module';
 import { TrackingModule } from './tracking/tracking.module';
 import { EnforcementModule } from './enforcement/enforcement.module';
+import { AssetsModule } from './assets/assets.module';
+import { CustomersModule } from './customers/customers.module';
 import { type Env, validateEnv } from './config/env.validation';
 
 @Module({
@@ -45,6 +47,8 @@ import { type Env, validateEnv } from './config/env.validation';
     TcpModule,
     TrackingModule,
     EnforcementModule,
+    AssetsModule,
+    CustomersModule,
   ],
   controllers: [AppController],
   providers: [
