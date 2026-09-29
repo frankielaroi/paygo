@@ -37,6 +37,15 @@ const MAX_DEVICE_CLOCK_SKEW_MS = 5 * 60 * 1000;
  * A stationary reading is only as good as `recordedAt` is recent. `ignition` and `movement`
  * are null when the device did not report them, which means unknown, not off.
  */
+/** One historical reading, reduced to what a stationary check needs. */
+export interface SafetyReading {
+  recordedAt: Date;
+  speed: number;
+  ignition: boolean | null;
+  movement: boolean | null;
+  hasFix: boolean;
+}
+
 export interface TrackingSafetySnapshot {
   bikeId: string;
   speed: number;
@@ -44,6 +53,8 @@ export interface TrackingSafetySnapshot {
   movement: boolean | null;
   hasFix: boolean;
   recordedAt: Date;
+  /** Server time at which the reading above arrived. */
+  receivedAt: Date;
   lastReportedAt: Date;
   online: boolean;
 }
@@ -285,6 +296,7 @@ export class TrackingService
         currentPosition: {
           select: {
             recordedAt: true,
+            receivedAt: true,
             speed: true,
             ignition: true,
             movement: true,
@@ -304,6 +316,40 @@ export class TrackingService
       lastReportedAt: bike.lastReportedAt,
       online: this.isOnline(bike.lastReportedAt),
     };
+  }
+
+  /**
+   * The readings Enforcement needs to judge whether a bike has been stopped since `from`: the
+   * last reading at or before `from` (the anchor, proving the state at the start of the window)
+   * and every reading after it up to `to`, oldest first. Judging them is Enforcement's job.
+   */
+  async getSafetyWindow(
+    bikeId: string,
+    from: Date,
+    to: Date,
+  ): Promise<{ anchor: SafetyReading | null; readings: SafetyReading[] }> {
+    const select = {
+      recordedAt: true,
+      speed: true,
+      ignition: true,
+      movement: true,
+      hasFix: true,
+    } as const;
+
+    const [anchor, readings] = await Promise.all([
+      this.prisma.bikePosition.findFirst({
+        where: { bikeId, recordedAt: { lte: from } },
+        orderBy: { recordedAt: 'desc' },
+        select,
+      }),
+      this.prisma.bikePosition.findMany({
+        where: { bikeId, recordedAt: { gt: from, lte: to } },
+        orderBy: { recordedAt: 'asc' },
+        select,
+      }),
+    ]);
+
+    return { anchor, readings };
   }
 
   watchPositionUpdates(): Observable<BikeStatusDto> {
