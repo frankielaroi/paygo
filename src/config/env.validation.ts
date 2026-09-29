@@ -86,6 +86,13 @@ export const envSchema = z.object({
     .transform((value) => value === 'true'),
   TCP_DEVICE_PORT: port.default(5027),
 
+  TRACKING_OFFLINE_AFTER_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(86400)
+    .default(300),
+
   SWAGGER_ENABLED: z
     .enum(['true', 'false'])
     .default('false')

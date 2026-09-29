@@ -19,6 +19,7 @@ describe('validateEnv', () => {
     expect(env.JWT_EXPIRES_IN).toBe('15m');
     expect(env.REFRESH_TOKEN_TTL_DAYS).toBe(30);
     expect(env.LOGIN_MAX_ATTEMPTS).toBe(5);
+    expect(env.TRACKING_OFFLINE_AFTER_SECONDS).toBe(300);
     expect(env.SWAGGER_ENABLED).toBe(false);
   });
 

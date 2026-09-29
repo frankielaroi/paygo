@@ -183,3 +183,66 @@ model CustomerContact {
   @@index([customerId, type])
   @@map("customer_contacts")
 }
+
+// ---------------------------------------------------------------------------
+// Fleet tracking
+// ---------------------------------------------------------------------------
+
+/// A tracked bike and the device currently assigned to it.
+model Bike {
+  id                 String               @id @default(uuid()) @db.Uuid
+  imei               String               @unique
+  label              String
+  registrationNumber String?              @unique
+  lastReportedAt     DateTime?
+  positions          BikePosition[]
+  currentPosition    BikeCurrentPosition?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("bikes")
+}
+
+/// Append-only, queryable telemetry history. Device retries for the same timestamp are
+/// idempotent, while server receive time remains separate for online/offline calculations.
+model BikePosition {
+  id        String   @id @default(uuid()) @db.Uuid
+  bikeId    String   @db.Uuid
+  bike      Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
+  recordedAt DateTime
+  receivedAt DateTime
+  latitude   Float
+  longitude  Float
+  altitude   Int
+  angle      Int
+  satellites Int
+  speed      Int
+  ignition   Boolean?
+  movement   Boolean?
+  hasFix     Boolean
+
+  @@unique([bikeId, recordedAt])
+  @@index([bikeId, recordedAt])
+  @@map("bike_positions")
+}
+
+/// One latest known telemetry snapshot per bike, maintained only when an event is newer.
+model BikeCurrentPosition {
+  bikeId     String   @id @db.Uuid
+  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
+  recordedAt DateTime
+  receivedAt DateTime
+  latitude   Float
+  longitude  Float
+  altitude   Int
+  angle      Int
+  satellites Int
+  speed      Int
+  ignition   Boolean?
+  movement   Boolean?
+  hasFix     Boolean
+
+  @@index([receivedAt])
+  @@map("bike_current_positions")
+}
