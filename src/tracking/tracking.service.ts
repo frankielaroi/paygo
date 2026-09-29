@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -11,13 +10,11 @@ import { ConfigService } from '@nestjs/config';
 import { OnEvent } from '@nestjs/event-emitter';
 import { Observable, Subject } from 'rxjs';
 import type { Env } from '../config/env.validation';
-import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { DevicePosition } from '../tcp/codec8-parser';
 import { DEVICE_POSITIONS, type DevicePositionsEvent } from '../tcp/tcp.events';
 import { BikePositionDto } from './dto/bike-position.dto';
 import { BikeStatusDto } from './dto/bike-status.dto';
-import { CreateBikeDto } from './dto/create-bike.dto';
 
 /**
  * How far ahead of the server clock a device timestamp may be and still become the current
@@ -182,31 +179,6 @@ export class TrackingService
       this.logger.error(
         `Could not process positions from IMEI ${event.imei}: ${detail}`,
       );
-    }
-  }
-
-  async registerBike(input: CreateBikeDto): Promise<BikeStatusDto> {
-    try {
-      const bike = await this.prisma.bike.create({
-        data: {
-          imei: input.imei,
-          label: input.label,
-          registrationNumber: input.registrationNumber,
-        },
-        select: { id: true },
-      });
-
-      return await this.getBikeStatus(bike.id);
-    } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
-        throw new ConflictException(
-          'A bike with this IMEI or registration number already exists',
-        );
-      }
-      throw error;
     }
   }
 
@@ -420,7 +392,7 @@ export class TrackingService
 
   private toBikeStatus(bike: {
     id: string;
-    imei: string;
+    imei: string | null;
     label: string;
     registrationNumber: string | null;
     lastReportedAt: Date | null;

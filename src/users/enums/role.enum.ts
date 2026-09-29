@@ -20,7 +20,18 @@ export const Permission = {
   CUSTOMER_READ_OWN: 'customer:read:own',
   CUSTOMER_READ_ALL: 'customer:read:all',
   CUSTOMER_REASSIGN: 'customer:reassign',
+  /** Edit a rider's profile. Field agents only reach their own riders (checked in the service). */
+  CUSTOMER_UPDATE: 'customer:update',
+  /** Deactivate a rider. */
+  CUSTOMER_MANAGE: 'customer:manage',
   KYC_VERIFY: 'kyc:verify',
+  /**
+   * Read bike inventory. Admin only for now: a bike record names its rider, and field agents
+   * reach their own riders' bikes through the customer record instead.
+   */
+  ASSET_READ: 'asset:read',
+  /** Add and edit bikes, fit trackers, assign, transfer, repossess, retire. */
+  ASSET_MANAGE: 'asset:manage',
   /**
    * Remote immobilize / restore. Deliberately NOT granted to field agents: an agent in
    * the field is the most likely person to want it and the least able to verify the bike
@@ -38,12 +49,17 @@ const ROLE_PERMISSIONS: Record<StaffRole, readonly Permission[]> = {
     Permission.CUSTOMER_READ_OWN,
     Permission.CUSTOMER_READ_ALL,
     Permission.CUSTOMER_REASSIGN,
+    Permission.CUSTOMER_UPDATE,
+    Permission.CUSTOMER_MANAGE,
     Permission.KYC_VERIFY,
+    Permission.ASSET_READ,
+    Permission.ASSET_MANAGE,
     Permission.ASSET_IMMOBILIZE,
   ],
   [StaffRole.FIELD_AGENT]: [
     Permission.CUSTOMER_CREATE,
     Permission.CUSTOMER_READ_OWN,
+    Permission.CUSTOMER_UPDATE,
   ],
 };
 

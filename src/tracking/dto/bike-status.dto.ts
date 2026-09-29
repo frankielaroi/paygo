@@ -8,8 +8,11 @@ export class BikeStatusDto {
   @ApiProperty()
   label!: string;
 
-  @ApiProperty()
-  imei!: string;
+  @ApiProperty({
+    nullable: true,
+    description: 'Null until a tracker is fitted',
+  })
+  imei!: string | null;
 
   @ApiProperty({ nullable: true })
   registrationNumber!: string | null;

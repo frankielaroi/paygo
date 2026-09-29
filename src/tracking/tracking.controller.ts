@@ -1,17 +1,14 @@
 import {
-  Body,
   Controller,
   Get,
   Param,
   ParseUUIDPipe,
-  Post,
   Query,
   Sse,
   MessageEvent,
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
-  ApiCreatedResponse,
   ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
@@ -19,28 +16,21 @@ import {
   ApiQuery,
   ApiTags,
 } from '@nestjs/swagger';
-import { Roles } from '../common/decorators/roles.decorator';
-import { StaffRole } from '../users/enums/role.enum';
+import { RequirePermissions } from '../common/decorators/permissions.decorator';
+import { Permission } from '../users/enums/role.enum';
 import { BikePositionDto } from './dto/bike-position.dto';
 import { BikeStatusDto } from './dto/bike-status.dto';
-import { CreateBikeDto } from './dto/create-bike.dto';
 import { TrackingQueryDto } from './dto/tracking-query.dto';
 import { map, Observable } from 'rxjs';
 import { TrackingService } from './tracking.service';
 
+/** Read-only telemetry views. Bikes are added and fitted with trackers in the assets module. */
 @ApiTags('tracking')
 @ApiBearerAuth('bearer')
-@Roles(StaffRole.ADMIN)
+@RequirePermissions(Permission.ASSET_READ)
 @Controller('tracking')
 export class TrackingController {
   constructor(private readonly tracking: TrackingService) {}
-
-  @Post('bikes')
-  @ApiOperation({ summary: 'Register a bike and its tracker IMEI' })
-  @ApiCreatedResponse({ type: BikeStatusDto })
-  registerBike(@Body() input: CreateBikeDto): Promise<BikeStatusDto> {
-    return this.tracking.registerBike(input);
-  }
 
   @Get('bikes')
   @ApiOperation({ summary: 'List current status for tracked bikes' })

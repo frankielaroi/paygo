@@ -60,6 +60,12 @@ model User {
   refreshTokens      RefreshToken[]
   enforcementActions EnforcementEvent[]
 
+  trackersInstalled    BikeTrackerInstallation[] @relation("TrackerInstalledBy")
+  trackersRemoved      BikeTrackerInstallation[] @relation("TrackerRemovedBy")
+  bikesAssigned        BikeAssignment[]          @relation("BikeAssignedBy")
+  bikeAssignmentsEnded BikeAssignment[]          @relation("BikeAssignmentEndedBy")
+  bikeStatusChanges    BikeStatusChange[]        @relation("BikeStatusChangedBy")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -149,6 +155,14 @@ model Customer {
 
   contacts CustomerContact[]
 
+  /// Set with status CLOSED. Riders are deactivated, never deleted, so their history survives.
+  deactivatedAt      DateTime?
+  deactivationReason String?
+
+  /// Every bike this rider has held, past and present. Contracts will hang off these once
+  /// they exist; until then this is the rider's financing history.
+  bikeAssignments BikeAssignment[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -189,30 +203,141 @@ model CustomerContact {
 // Fleet tracking
 // ---------------------------------------------------------------------------
 
-/// A tracked bike and the device currently assigned to it.
+/// Where a bike is in its life. Mobility (immobilized or not) is deliberately NOT a status here:
+/// it belongs to enforcement, which is the only thing that knows what the device confirmed.
+/// Status moves only through the actions in the assets module, never by direct assignment, so
+/// it cannot disagree with the assignment history.
+enum BikeStatus {
+  IN_INVENTORY
+  ASSIGNED
+  REPOSSESSED
+  SOLD
+  RETIRED
+}
+
+/// A financed motorbike, from the moment it enters inventory. `imei` is the tracker installed
+/// right now (null before one is fitted); BikeTrackerInstallation holds every past one.
 model Bike {
-  id                 String               @id @default(uuid()) @db.Uuid
-  imei               String               @unique
+  id                 String  @id @default(uuid()) @db.Uuid
+  imei               String? @unique
+  /// Short fleet name shown on the map, e.g. "Bike 7".
   label              String
-  registrationNumber String?              @unique
-  lastReportedAt     DateTime?
-  positions          BikePosition[]
-  currentPosition    BikeCurrentPosition?
-  enforcement        BikeEnforcement?
-  enforcementEvents  EnforcementEvent[]
+  /// Number plate.
+  registrationNumber String? @unique
+  /// Chassis number. The one identifier that never changes over the bike's life.
+  vin                String  @unique
+  make               String
+  model              String
+  year               Int?
+  color              String?
+
+  /// Purchase cost in minor units, with its currency. Both or neither (database check).
+  purchasePriceMinor Int?
+  purchaseCurrency   String?   @db.Char(3)
+  purchasedAt        DateTime? @db.Date
+  supplier           String?
+
+  status    BikeStatus @default(IN_INVENTORY)
+  retiredAt DateTime?
+
+  lastReportedAt       DateTime?
+  positions            BikePosition[]
+  currentPosition      BikeCurrentPosition?
+  enforcement          BikeEnforcement?
+  enforcementEvents    EnforcementEvent[]
+  trackerInstallations BikeTrackerInstallation[]
+  assignments          BikeAssignment[]
+  statusChanges        BikeStatusChange[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@index([status])
   @@map("bikes")
+}
+
+/// Every tracker ever fitted to a bike. At most one open row per bike and per IMEI, enforced by
+/// partial unique indexes in the migration (Prisma cannot express them).
+model BikeTrackerInstallation {
+  id     String @id @default(uuid()) @db.Uuid
+  bikeId String @db.Uuid
+  bike   Bike   @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+  imei   String
+
+  installedAt   DateTime  @default(now())
+  /// Null only for trackers fitted before installation history was kept (backfilled rows).
+  installedById String?   @db.Uuid
+  installedBy   User?     @relation("TrackerInstalledBy", fields: [installedById], references: [id], onDelete: Restrict)
+  removedAt     DateTime?
+  removedById   String?   @db.Uuid
+  removedBy     User?     @relation("TrackerRemovedBy", fields: [removedById], references: [id], onDelete: Restrict)
+  removedReason String?
+
+  @@index([bikeId, installedAt])
+  @@index([imei])
+  @@map("bike_tracker_installations")
+}
+
+enum AssignmentEndReason {
+  /// Handed back to inventory.
+  RETURNED
+  /// Moved to another rider; the next assignment starts at the same moment.
+  TRANSFERRED
+  /// Taken back for non-payment.
+  REPOSSESSED
+  /// Paid off and ownership passed to the rider.
+  SOLD
+}
+
+/// Which rider holds a bike, and when. Never deleted, so a rider's history across bikes and a
+/// bike's history across riders both survive. At most one open row per bike (partial unique
+/// index in the migration), which is what makes a double assignment impossible even under a
+/// race, not just unlikely.
+model BikeAssignment {
+  id         String   @id @default(uuid()) @db.Uuid
+  bikeId     String   @db.Uuid
+  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+  customerId String   @db.Uuid
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  startedAt    DateTime @default(now())
+  assignedById String   @db.Uuid
+  assignedBy   User     @relation("BikeAssignedBy", fields: [assignedById], references: [id], onDelete: Restrict)
+
+  endedAt   DateTime?
+  endReason AssignmentEndReason?
+  endedById String?              @db.Uuid
+  endedBy   User?                @relation("BikeAssignmentEndedBy", fields: [endedById], references: [id], onDelete: Restrict)
+  notes     String?
+
+  @@index([bikeId, startedAt])
+  @@index([customerId, startedAt])
+  @@map("bike_assignments")
+}
+
+/// Append-only log of every status change, with who made it and why.
+model BikeStatusChange {
+  id          String      @id @default(uuid()) @db.Uuid
+  bikeId      String      @db.Uuid
+  bike        Bike        @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+  fromStatus  BikeStatus?
+  toStatus    BikeStatus
+  reason      String
+  actorUserId String      @db.Uuid
+  actor       User        @relation("BikeStatusChangedBy", fields: [actorUserId], references: [id], onDelete: Restrict)
+  createdAt   DateTime    @default(now())
+
+  @@index([bikeId, createdAt])
+  @@map("bike_status_changes")
 }
 
 /// Append-only, queryable telemetry history. Device retries for the same timestamp are
 /// idempotent, while server receive time remains separate for online/offline calculations.
+/// Restrict, not Cascade: bikes are retired, never deleted, and history must not vanish.
 model BikePosition {
   id         String   @id @default(uuid()) @db.Uuid
   bikeId     String   @db.Uuid
-  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
+  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Restrict)
   recordedAt DateTime
   receivedAt DateTime
   latitude   Float
@@ -274,6 +399,9 @@ enum EnforcementEventType {
   STATE_CONFIRMED
   RESPONSE_UNRECOGNIZED
   REVIEW_FLAGGED
+  /// The tracker was installed, replaced or removed, so the confirmed state no longer describes
+  /// the device that is now fitted.
+  TRACKER_CHANGED
 }
 
 /// Desired versus device-confirmed mobility for one bike. The reconciler is the only thing that

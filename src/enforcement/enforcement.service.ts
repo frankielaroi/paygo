@@ -58,7 +58,8 @@ export type ReconcileTrigger =
   | 'arrears'
   | 'device-connected'
   | 'telemetry'
-  | 'command-response';
+  | 'command-response'
+  | 'tracker-changed';
 
 export interface EnforcementView {
   state: BikeEnforcement | null;
@@ -308,6 +309,47 @@ export class EnforcementService
     return { state, events };
   }
 
+  /**
+   * For the assets module, inside the transaction that installs, replaces or removes a tracker.
+   * The confirmed state described the old unit, and the new one's relay could be in either
+   * position, so confirmed becomes unknown and any unconfirmed command is dropped. The caller
+   * then calls reconcile(bikeId, 'tracker-changed') after commit, which drives the new unit to
+   * the desired state; an immobilize still goes through the interlock.
+   */
+  async recordTrackerChange(
+    tx: Prisma.TransactionClient,
+    bikeId: string,
+    change: { fromImei: string | null; toImei: string | null; userId: string },
+  ): Promise<void> {
+    const row = await tx.bikeEnforcement.findUnique({ where: { bikeId } });
+    if (!row) {
+      return;
+    }
+
+    await tx.bikeEnforcement.update({
+      where: { bikeId },
+      data: {
+        confirmedState: null,
+        confirmedAt: null,
+        pendingCommand: null,
+        pendingSentAt: null,
+        blockedReason: null,
+      },
+    });
+    await tx.enforcementEvent.create({
+      data: {
+        bikeId,
+        type: EnforcementEventType.TRACKER_CHANGED,
+        actorUserId: change.userId,
+        trigger: 'staff',
+        fromState: row.confirmedState,
+        toState: row.desiredState,
+        reason: 'Tracker changed; confirmed state reset to unknown',
+        detail: { fromImei: change.fromImei, toImei: change.toImei },
+      },
+    });
+  }
+
   listForReview(): Promise<BikeEnforcement[]> {
     return this.prisma.bikeEnforcement.findMany({
       where: { reviewReason: { not: null } },
@@ -424,6 +466,19 @@ export class EnforcementService
       return;
     }
 
+    const imei = row.bike.imei;
+    if (!imei) {
+      await this.recordBlock(
+        row,
+        EnforcementEventType.COMMAND_FAILED,
+        'no-tracker-fitted',
+        trigger,
+        null,
+        false,
+      );
+      return;
+    }
+
     let telemetry: TrackingSafetySnapshot | null = null;
 
     if (wanted === MobilityState.IMMOBILIZED) {
@@ -434,7 +489,7 @@ export class EnforcementService
         telemetry,
         now,
         settings,
-        this.devices.connectedSince(row.bike.imei),
+        this.devices.connectedSince(imei),
       );
       if (verdict.safe && telemetry) {
         verdict = checkSustained(
@@ -459,7 +514,7 @@ export class EnforcementService
       }
     }
 
-    if (!this.devices.isConnected(row.bike.imei)) {
+    if (!this.devices.isConnected(imei)) {
       await this.recordBlock(
         row,
         EnforcementEventType.COMMAND_FAILED,
@@ -492,10 +547,7 @@ export class EnforcementService
       return;
     }
 
-    const result = this.devices.sendCommand(
-      row.bike.imei,
-      COMMAND_FOR_STATE[wanted],
-    );
+    const result = this.devices.sendCommand(imei, COMMAND_FOR_STATE[wanted]);
 
     if (result.delivered) {
       await this.prisma.enforcementEvent.create({

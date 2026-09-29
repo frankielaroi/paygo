@@ -1,7 +1,5 @@
-import { ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Env } from '../config/env.validation';
-import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { DevicePosition } from '../tcp/codec8-parser';
 import type { DevicePositionsEvent } from '../tcp/tcp.events';
@@ -277,24 +275,6 @@ describe('TrackingService', () => {
       .sort();
     expect(bikeIds).toEqual(['bike-1', 'bike-2']);
     service.onModuleDestroy();
-  });
-
-  it('rejects a second bike with an already registered IMEI as a conflict', async () => {
-    const prisma = {
-      bike: {
-        create: jest.fn().mockRejectedValue(
-          new Prisma.PrismaClientKnownRequestError('Unique constraint', {
-            code: 'P2002',
-            clientVersion: 'test',
-          }),
-        ),
-      },
-    } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
-
-    await expect(
-      service.registerBike({ label: 'Bike 8', imei: event.imei }),
-    ).rejects.toBeInstanceOf(ConflictException);
   });
 
   it('returns an explicit empty and offline status before the first report', async () => {
