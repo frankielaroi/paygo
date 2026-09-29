@@ -33,7 +33,22 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
   through `EventEmitterModule`, and persists nothing.
 - Tracking (`src/tracking/`): IMEI-to-bike mapping, deduplicated position history, monotonic
   current snapshots, derived online/offline status, authenticated SSE updates, and a typed
-  safety snapshot lookup for Enforcement. An admin registers each bike and tracker IMEI.
+  safety snapshot lookup for Enforcement. Read-only: bikes are added in `assets/`.
+- Bikes (`src/assets/`, routes under `/bikes`): inventory (VIN, plate, make, model, purchase
+  price in minor units with currency), tracker installation history, rider assignments, and a
+  lifecycle status (`IN_INVENTORY`, `ASSIGNED`, `REPOSSESSED`, `SOLD`, `RETIRED`) with an
+  append-only change log. Status moves only through actions (assign, transfer, end assignment,
+  restock, retire), each a conditional update naming the statuses it may start from.
+  Immobilized is **not** a status: mobility belongs to enforcement and is shown alongside.
+  Partial unique indexes (hand-written in the migration, Prisma cannot express them) allow at
+  most one open assignment per bike and one open tracker per bike and per IMEI. A tracker swap
+  resets enforcement's confirmed state to unknown in the same transaction, because the new
+  unit's relay could be in either position.
+- Riders (`src/customers/`): profile, KYC, guarantors and next of kin, search by name, phone
+  or national ID, and every bike held (the financing history until contracts exist). Field
+  agents reach only riders assigned to them (404 otherwise). Changing an identity field clears
+  KYC; only a KYC-verified, active rider can be assigned a bike. Riders are deactivated and bikes
+  retired, never deleted, and every foreign key into them is `Restrict`.
 - Enforcement core (`src/enforcement/`): per-bike desired vs confirmed mobility state, the
   reconciler (runs on device connect, committed telemetry, and a timer sweep), the stationary
   interlock (`interlock.ts`, pure), confirmation from the device's Codec 12 reply only, an
