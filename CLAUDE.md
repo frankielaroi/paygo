@@ -54,13 +54,35 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
   interlock (`interlock.ts`, pure), confirmation from the device's Codec 12 reply only, an
   append-only `enforcement_events` audit log, a review list for bikes whose telemetry cannot be
   trusted, and admin manual lock/unlock (`asset:immobilize`).
-  Overdue detection sits behind the `ARREARS_SOURCE` interface; until contracts exist it is
-  bound to `NoArrearsSource`, so the sweep never immobilizes on its own. Payments must call
-  `EnforcementService.applyArrears(bikeId, false, ...)` once the ledger shows a contract
-  current. A staff lock is sticky (arrears and payments never lift it); a staff unlock hands the
-  bike back to arrears control.
+  Overdue detection sits behind the `ARREARS_SOURCE` interface, bound to `LoanArrearsService`.
+  Payments call `EnforcementService.applyArrears(bikeId, false, ...)` when a payment leaves the
+  loan current. A staff lock is sticky (arrears and payments never lift it); a staff unlock
+  hands the bike back to arrears control.
+- Loans (`src/loans/`, the "contracts" of the layout below): terms, a full schedule generated
+  at creation (`schedule.ts`, pure: `generateSchedule`, `allocatePayment`, `overdueMinor`), and
+  the lifecycle ACTIVE / COMPLETED / DEFAULTED / REPOSSESSED. A loan needs the bike already
+  assigned to the rider; at most one open loan per bike (partial unique index). While a loan is
+  open the bike cannot be transferred, returned or sold; repossession goes through the loan.
+  **The catch-up rule:** payments apply oldest installment first; an installment is overdue from
+  the start of the day after `dueDate + graceDays`; a loan is current only when nothing past
+  grace is owed. A partial payment reduces arrears but never clears them. "Paid" always comes
+  from the ledger (credits on the loan's receivable), never from the installment cache.
+  `LoanArrearsService` lives in its own `LoanArrearsModule` so enforcement can import it
+  without a cycle; its SQL and `overdueMinor` must agree, and an e2e test checks they do.
+- Ledger (`src/ledger/`): double-entry, append-only. `LedgerService.post` refuses unbalanced or
+  malformed postings; database triggers refuse UPDATE/DELETE on ledger rows and reject any
+  transaction that does not balance at commit.
+- Payments (`src/payments/`): Paystack `charge.success` webhooks at `POST /webhooks/paystack`,
+  authenticated by HMAC-SHA512 over the raw body (`PAYSTACK_SECRET_KEY`, `rawBody: true` in
+  `main.ts`). Idempotency is the unique (provider, reference) constraint, inserted first in the
+  same transaction as everything it causes. The loan comes from `metadata.loan_id`, set when
+  the charge is initiated. Money that cannot be applied is never refused: it is recorded as
+  UNALLOCATED and held in the ledger until staff allocate it. Manual payments
+  (`POST /loans/:id/payments`) are refused outright instead. Processing is inline for now;
+  when BullMQ lands the webhook should enqueue.
 
-**Not built yet:** plans, contracts, payments, ledger, Redis/BullMQ,
+**Not built yet:** plans, initiating Paystack charges (the webhook expects `metadata.loan_id`),
+write-offs and reversals, refunds of rider credit, Redis/BullMQ,
 customer (rider) authentication, revoking sessions on password change
 (`RefreshTokenService.revokeAllForUser` exists but nothing calls it), and a job to delete
 expired refresh token rows.
@@ -245,7 +267,7 @@ src/
   customers/               # riders being financed. KYC, guarantors. NOT in users (see below)
   assets/                  # financed motorbikes: identity, GPS device, state
   plans/                   # financing plans: price, deposit, tenor, rate
-  contracts/               # a customer's plan on a motorbike; payment schedule
+  loans/                   # a customer's plan on a motorbike; payment schedule ("contracts")
   payments/                # inbound payments, provider webhooks, allocation
   ledger/                  # append-only double-entry account movements
   positions/               # telemetry persistence: GPS fixes, ignition, movement
@@ -688,7 +710,11 @@ Expected variables:
 | `ENFORCEMENT_MAX_TELEMETRY_AGE_SECONDS` | Interlock: oldest reading it will trust (default 300); keep the tracker's on-stop report period below it |
 | `ENFORCEMENT_COMMAND_RETRY_SECONDS` | Wait for a device reply before resending a command (default 300) |
 | `ENFORCEMENT_SWEEP_INTERVAL_SECONDS` | Arrears sweep and retry interval (default 900) |
-| `RESTORE_ARREARS_THRESHOLD` | How current a contract must be to auto-restore mobility |
+| `PAYSTACK_SECRET_KEY` | Verifies Paystack webhook signatures; without it the webhook refuses every request |
+
+There is deliberately no restore threshold variable: the catch-up rule is "nothing past grace
+owed", with no tolerance. Changing that is a business decision, and belongs in `overdueMinor`
+and the arrears SQL together.
 
 ### Testing Strategy
 
