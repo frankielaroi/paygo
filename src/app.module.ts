@@ -11,6 +11,7 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { PrismaModule } from './prisma/prisma.module';
 import { TcpModule } from './tcp/tcp.module';
 import { TrackingModule } from './tracking/tracking.module';
+import { EnforcementModule } from './enforcement/enforcement.module';
 import { type Env, validateEnv } from './config/env.validation';
 
 @Module({
@@ -43,6 +44,7 @@ import { type Env, validateEnv } from './config/env.validation';
     AuthModule,
     TcpModule,
     TrackingModule,
+    EnforcementModule,
   ],
   controllers: [AppController],
   providers: [
