@@ -57,7 +57,8 @@ model User {
   registeredCustomers  Customer[] @relation("CustomerRegisteredBy")
   kycVerifiedCustomers Customer[] @relation("CustomerKycVerifiedBy")
 
-  refreshTokens RefreshToken[]
+  refreshTokens      RefreshToken[]
+  enforcementActions EnforcementEvent[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -197,6 +198,8 @@ model Bike {
   lastReportedAt     DateTime?
   positions          BikePosition[]
   currentPosition    BikeCurrentPosition?
+  enforcement        BikeEnforcement?
+  enforcementEvents  EnforcementEvent[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -207,9 +210,9 @@ model Bike {
 /// Append-only, queryable telemetry history. Device retries for the same timestamp are
 /// idempotent, while server receive time remains separate for online/offline calculations.
 model BikePosition {
-  id        String   @id @default(uuid()) @db.Uuid
-  bikeId    String   @db.Uuid
-  bike      Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
+  id         String   @id @default(uuid()) @db.Uuid
+  bikeId     String   @db.Uuid
+  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
   recordedAt DateTime
   receivedAt DateTime
   latitude   Float
@@ -245,4 +248,93 @@ model BikeCurrentPosition {
 
   @@index([receivedAt])
   @@map("bike_current_positions")
+}
+
+// ---------------------------------------------------------------------------
+// Enforcement
+// ---------------------------------------------------------------------------
+
+enum MobilityState {
+  MOBILE
+  IMMOBILIZED
+}
+
+/// Who set the current desired state. Arrears decisions are revisited by the sweep; a staff
+/// decision is not, so a manual lock is never silently undone by the next sweep.
+enum DesiredStateSource {
+  ARREARS
+  STAFF
+}
+
+enum EnforcementEventType {
+  DESIRED_STATE_CHANGED
+  COMMAND_SENT
+  COMMAND_FAILED
+  COMMAND_DEFERRED
+  STATE_CONFIRMED
+  RESPONSE_UNRECOGNIZED
+  REVIEW_FLAGGED
+}
+
+/// Desired versus device-confirmed mobility for one bike. The reconciler is the only thing that
+/// turns a difference between them into a command.
+model BikeEnforcement {
+  bikeId String @id @db.Uuid
+  bike   Bike   @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+
+  desiredState  MobilityState      @default(MOBILE)
+  desiredSource DesiredStateSource @default(ARREARS)
+
+  /// Null until the device has confirmed a state. Unknown is not MOBILE.
+  confirmedState MobilityState?
+  confirmedAt    DateTime?
+
+  /// The last command written and not yet confirmed. A write is not confirmation.
+  pendingCommand MobilityState?
+  pendingSentAt  DateTime?
+
+  /// Why the last reconcile did not act. An audit entry is written only when this changes, so
+  /// a sweep repeating the same deferral does not flood the log.
+  blockedReason String?
+
+  /// Set when an immobilize is wanted but telemetry is missing, stale or offline, and a person
+  /// should look instead of the system acting on data it cannot trust.
+  reviewReason String?
+  reviewSince  DateTime?
+
+  updatedAt DateTime @updatedAt
+
+  @@index([reviewReason])
+  @@map("bike_enforcement")
+}
+
+/// Append-only audit trail of every enforcement decision. Never updated or deleted: this is
+/// what answers a rider disputing an immobilization.
+model EnforcementEvent {
+  id     String @id @default(uuid()) @db.Uuid
+  bikeId String @db.Uuid
+  bike   Bike   @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+
+  type EnforcementEventType
+
+  /// Null for automatic actions. Set for a staff member's decision.
+  actorUserId String? @db.Uuid
+  actor       User?   @relation(fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  /// What triggered it: sweep, staff, device-connected, telemetry, command-response, timer.
+  trigger String
+
+  fromState MobilityState?
+  toState   MobilityState?
+  reason    String
+
+  /// The telemetry the interlock relied on, and any arrears snapshot, as they were at the time.
+  telemetry      Json?
+  detail         Json?
+  deviceResponse String?
+
+  createdAt DateTime @default(now())
+
+  @@index([bikeId, createdAt])
+  @@map("enforcement_events")
 }

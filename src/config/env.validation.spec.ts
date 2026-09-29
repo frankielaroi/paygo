@@ -20,6 +20,10 @@ describe('validateEnv', () => {
     expect(env.REFRESH_TOKEN_TTL_DAYS).toBe(30);
     expect(env.LOGIN_MAX_ATTEMPTS).toBe(5);
     expect(env.TRACKING_OFFLINE_AFTER_SECONDS).toBe(300);
+    expect(env.IMMOBILIZE_STATIONARY_SECONDS).toBe(120);
+    expect(env.ENFORCEMENT_MAX_TELEMETRY_AGE_SECONDS).toBe(300);
+    expect(env.ENFORCEMENT_COMMAND_RETRY_SECONDS).toBe(300);
+    expect(env.ENFORCEMENT_SWEEP_INTERVAL_SECONDS).toBe(900);
     expect(env.SWAGGER_ENABLED).toBe(false);
   });
 

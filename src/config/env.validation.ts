@@ -93,6 +93,36 @@ export const envSchema = z.object({
     .max(86400)
     .default(300),
 
+  // Enforcement interlock. How long a bike must have been stopped (speed 0, ignition off, with
+  // a GPS fix) before it may be immobilized, and how old its latest reading may be. A tracker's
+  // "on stop" report period must be shorter than the maximum age, or a parked bike never has
+  // fresh enough data to be immobilized and is flagged for review instead.
+  IMMOBILIZE_STATIONARY_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(86400)
+    .default(120),
+  ENFORCEMENT_MAX_TELEMETRY_AGE_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(86400)
+    .default(300),
+  // How long to wait for a device to confirm a command before sending it again.
+  ENFORCEMENT_COMMAND_RETRY_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(86400)
+    .default(300),
+  ENFORCEMENT_SWEEP_INTERVAL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(86400)
+    .default(900),
+
   SWAGGER_ENABLED: z
     .enum(['true', 'false'])
     .default('false')
