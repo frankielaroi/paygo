@@ -12,6 +12,7 @@ import {
   AssignmentEndReason,
   BikeStatus,
   CustomerStatus,
+  LoanStatus,
 } from '../generated/prisma/enums';
 import { PrismaService } from '../prisma/prisma.service';
 import type {
@@ -441,6 +442,7 @@ export class BikesService {
         if (open.customerId === input.customerId) {
           throw new ConflictException('The bike is already with this rider');
         }
+        await this.refuseIfOpenLoan(tx, id, 'transferred');
         await this.requireAssignableRider(tx, input.customerId);
 
         const now = new Date();
@@ -472,27 +474,82 @@ export class BikesService {
     userId: string,
   ): Promise<BikeDetailDto> {
     await this.prisma.$transaction(async (tx) => {
-      const open = await this.requireOpenAssignment(tx, id);
-      const next = STATUS_AFTER_END[input.reason];
-
-      await this.moveStatus(
+      await this.refuseIfOpenLoan(
         tx,
         id,
-        [BikeStatus.ASSIGNED],
-        next,
-        input.notes ?? endReasonText(input.reason),
-        userId,
+        input.reason === AssignmentEndReason.SOLD ? 'sold' : 'taken back',
       );
-      await this.closeAssignment(
+      await this.closeCurrentAssignment(
         tx,
-        open.id,
-        new Date(),
+        id,
         input.reason,
-        userId,
         input.notes,
+        userId,
       );
     });
     return this.get(id);
+  }
+
+  /**
+   * For the loans module only, inside the transaction that repossesses a loan: ends the
+   * assignment the loan financed, which the public path refuses while a loan is open.
+   */
+  async repossessUnderLoan(
+    tx: Prisma.TransactionClient,
+    bikeId: string,
+    notes: string,
+    userId: string,
+  ): Promise<void> {
+    await this.closeCurrentAssignment(
+      tx,
+      bikeId,
+      AssignmentEndReason.REPOSSESSED,
+      notes,
+      userId,
+    );
+  }
+
+  private async closeCurrentAssignment(
+    tx: Prisma.TransactionClient,
+    id: string,
+    reason: EndableReason,
+    notes: string | undefined,
+    userId: string,
+  ): Promise<void> {
+    const open = await this.requireOpenAssignment(tx, id);
+    await this.moveStatus(
+      tx,
+      id,
+      [BikeStatus.ASSIGNED],
+      STATUS_AFTER_END[reason],
+      notes ?? endReasonText(reason),
+      userId,
+    );
+    await this.closeAssignment(tx, open.id, new Date(), reason, userId, notes);
+  }
+
+  /**
+   * While a loan is open the bike is collateral: it cannot change hands, go back to stock, or be
+   * sold around the loan. A sale follows a completed loan; a repossession goes through the loan.
+   */
+  private async refuseIfOpenLoan(
+    tx: Prisma.TransactionClient,
+    bikeId: string,
+    action: string,
+  ): Promise<void> {
+    const loan = await tx.loan.findFirst({
+      where: {
+        bikeId,
+        status: { in: [LoanStatus.ACTIVE, LoanStatus.DEFAULTED] },
+      },
+      select: { id: true },
+    });
+    if (loan) {
+      throw new ConflictException(
+        `This bike has an open loan (${loan.id}) and cannot be ${action}; ` +
+          'settle the loan, or repossess through the loan',
+      );
+    }
   }
 
   /** A repossessed bike goes back into inventory once it has been checked over. */

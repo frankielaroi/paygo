@@ -38,6 +38,18 @@ export const Permission = {
    * is stopped. The safety interlock still applies on top of this permission.
    */
   ASSET_IMMOBILIZE: 'asset:immobilize',
+  /** Start a loan on a bike already assigned to a rider. */
+  LOAN_CREATE: 'loan:create',
+  /** Read loans of riders assigned to you (checked in the service). */
+  LOAN_READ_OWN: 'loan:read:own',
+  LOAN_READ_ALL: 'loan:read:all',
+  /** Declare a loan defaulted, or repossess the bike under it. */
+  LOAN_MANAGE: 'loan:manage',
+  /**
+   * Record money by hand, see unallocated payments and allocate them. Moves money, so admin
+   * only: a field agent must not move money, least of all onto their own riders' loans.
+   */
+  PAYMENT_MANAGE: 'payment:manage',
 } as const;
 
 export type Permission = (typeof Permission)[keyof typeof Permission];
@@ -55,11 +67,17 @@ const ROLE_PERMISSIONS: Record<StaffRole, readonly Permission[]> = {
     Permission.ASSET_READ,
     Permission.ASSET_MANAGE,
     Permission.ASSET_IMMOBILIZE,
+    Permission.LOAN_CREATE,
+    Permission.LOAN_READ_OWN,
+    Permission.LOAN_READ_ALL,
+    Permission.LOAN_MANAGE,
+    Permission.PAYMENT_MANAGE,
   ],
   [StaffRole.FIELD_AGENT]: [
     Permission.CUSTOMER_CREATE,
     Permission.CUSTOMER_READ_OWN,
     Permission.CUSTOMER_UPDATE,
+    Permission.LOAN_READ_OWN,
   ],
 };
 
