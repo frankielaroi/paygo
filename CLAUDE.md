@@ -13,8 +13,8 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
 
 **Built so far:**
 
-- Prisma 7 + Postgres wiring (`src/prisma/`), with the `User` (staff), `Customer` (rider)
-  and `CustomerContact` models. One migration applied: `init_users_customers_rbac`.
+- Prisma 7 + Postgres wiring (`src/prisma/`), with staff, customer, and fleet tracking models.
+  Migrations include RBAC, auth hardening, and `add_fleet_tracking`.
 - RBAC: `StaffRole`, the permission map in `src/users/enums/role.enum.ts`, the
   `@Roles` / `@RequirePermissions` / `@Public` / `@CurrentUser` decorators, and `RolesGuard`.
 - Auth (`src/auth/`): RS256 JWT access tokens, rotating refresh tokens, argon2id password
@@ -31,15 +31,18 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
   `TcpServerService` (IMEI handshake, socket map, framing, ACKs, `sendCommand`). It emits
   `device.connected`, `device.disconnected`, `device.positions` and `device.command-response`
   through `EventEmitterModule`, and persists nothing.
+- Tracking (`src/tracking/`): IMEI-to-bike mapping, deduplicated position history, monotonic
+  current snapshots, derived online/offline status, authenticated SSE updates, and a typed
+  safety snapshot lookup for Enforcement. An admin registers each bike and tracker IMEI.
 
-**Not built yet:** plans, contracts, payments, ledger, positions, enforcement, Redis/BullMQ,
+**Not built yet:** plans, contracts, payments, ledger, enforcement, Redis/BullMQ,
 customer (rider) authentication, revoking sessions on password change
 (`RefreshTokenService.revokeAllForUser` exists but nothing calls it), and a job to delete
 expired refresh token rows.
 
-**Nothing listens to the device events yet.** `src/tcp/` emits positions and nobody subscribes,
-so telemetry is decoded and discarded. The next piece is `positions/` persisting
-`device.positions`, which is also what proves the decoupling works end to end.
+`src/tracking/` subscribes to `device.positions`. The protocol layer remains unaware of bike
+records and persistence; tracking resolves each IMEI, stores readable telemetry, and never
+makes immobilization decisions.
 
 Everything below describing those unbuilt pieces is the **target architecture and the
 conventions to follow when adding code**, not files that already exist. When implementing a
@@ -221,6 +224,7 @@ src/
   payments/                # inbound payments, provider webhooks, allocation
   ledger/                  # append-only double-entry account movements
   positions/               # telemetry persistence: GPS fixes, ignition, movement
+  tracking/                # IMEI resolution, current status, history, and live updates
   enforcement/             # desired mobility state, arrears rules, safety interlock
     reconciler.service.ts  #   desired vs confirmed state -> command, when safe
   tcp/                     # raw TCP device protocol (see Device Telemetry)
@@ -654,6 +658,7 @@ Expected variables:
 | `REDIS_HOST` / `REDIS_PORT` | BullMQ connection |
 | `TCP_DEVICE_ENABLED` | `false` disables the device listener (set for e2e runs) |
 | `TCP_DEVICE_PORT` | Raw TCP listener for Teltonika devices (default 5027) |
+| `TRACKING_OFFLINE_AFTER_SECONDS` | Quiet period before a bike is reported offline (default 300) |
 | `IMMOBILIZE_STATIONARY_SECONDS` | Interlock: how long an asset must be stopped first |
 | `RESTORE_ARREARS_THRESHOLD` | How current a contract must be to auto-restore mobility |
 
