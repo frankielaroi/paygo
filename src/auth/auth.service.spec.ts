@@ -1,4 +1,4 @@
-import { UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { AuthService } from './auth.service';
@@ -29,6 +29,8 @@ const CONFIG_VALUES: Record<string, string | number> = {
 function build(
   overrides: {
     user?: unknown;
+    /** Accounts a phone lookup finds. Defaults to the admin alone. */
+    phoneMatches?: unknown[];
     passwordMatches?: boolean;
   } = {},
 ) {
@@ -38,6 +40,9 @@ function build(
       findUnique: jest
         .fn()
         .mockResolvedValue('user' in overrides ? overrides.user : activeAdmin),
+      findMany: jest
+        .fn()
+        .mockResolvedValue(overrides.phoneMatches ?? [activeAdmin]),
       update: jest.fn().mockResolvedValue(undefined),
     },
   } as unknown as PrismaService;
@@ -198,6 +203,67 @@ describe('AuthService.login', () => {
     await service.login(credentials).catch(() => undefined);
 
     expect(jwt.signAsync).not.toHaveBeenCalled();
+  });
+});
+
+describe('AuthService.login by phone', () => {
+  const byPhone = { phone: '0241234567', password: 'correct-horse' };
+
+  interface FindManyArgs {
+    where: { phone: { in: string[] } };
+  }
+
+  it('signs in with a phone number in any stored form', async () => {
+    const { service, prisma } = build();
+
+    const result = await service.login(byPhone);
+
+    expect(result.accessToken).toBe('signed.jwt.token');
+    const findMany = prisma.user.findMany as unknown as jest.Mock<
+      unknown,
+      [FindManyArgs]
+    >;
+    expect(findMany.mock.calls[0][0].where.phone.in).toEqual(
+      expect.arrayContaining(['0241234567', '+233241234567', '233241234567']),
+    );
+  });
+
+  it('rejects an unknown phone with the same error as a wrong password', async () => {
+    const { service, passwords } = build({
+      phoneMatches: [],
+      passwordMatches: false,
+    });
+
+    await expect(service.login(byPhone)).rejects.toThrow('Invalid credentials');
+    // Still hashes, so timing does not reveal that the number is unknown.
+    expect(passwords.verify).toHaveBeenCalledTimes(1);
+  });
+
+  // Two accounts holding one number in different forms: signing in either would be a guess.
+  it('refuses a phone that matches more than one account', async () => {
+    const { service, jwt } = build({
+      phoneMatches: [activeAdmin, { ...activeAdmin, id: 'user-2' }],
+    });
+
+    await expect(service.login(byPhone)).rejects.toThrow(UnauthorizedException);
+    expect(jwt.signAsync).not.toHaveBeenCalled();
+  });
+
+  it('counts failed phone attempts against the account', async () => {
+    const { service, prisma } = build({ passwordMatches: false });
+
+    await service.login(byPhone).catch(() => undefined);
+
+    expect(updateCalls(prisma)[0].data.failedLoginAttempts).toBe(1);
+  });
+
+  it.each([
+    ['both', { ...credentials, phone: '0241234567' }],
+    ['neither', { password: 'correct-horse' }],
+  ])('refuses %s email and phone', async (_case, dto) => {
+    const { service } = build();
+
+    await expect(service.login(dto)).rejects.toThrow(BadRequestException);
   });
 });
 
