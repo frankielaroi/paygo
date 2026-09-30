@@ -7,7 +7,7 @@ import {
   OnModuleDestroy,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OnEvent } from '@nestjs/event-emitter';
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
 import type { Subscription } from 'rxjs';
 import type { Env } from '../config/env.validation';
 import {
@@ -41,6 +41,12 @@ import {
   type ArrearsDetail,
   type ArrearsSource,
 } from './arrears-source';
+import {
+  ENFORCEMENT_REVIEW_FLAGGED,
+  ENFORCEMENT_STATE_CONFIRMED,
+  type EnforcementReviewFlaggedEvent,
+  type EnforcementStateConfirmedEvent,
+} from './enforcement.events';
 import {
   checkLatest,
   checkSustained,
@@ -109,6 +115,7 @@ export class EnforcementService
     private readonly tracking: TrackingService,
     private readonly devices: TcpServerService,
     @Inject(ARREARS_SOURCE) private readonly arrears: ArrearsSource,
+    private readonly events: EventEmitter2,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -203,6 +210,12 @@ export class EnforcementService
       const overdueIds = new Set(overdue.map((finding) => finding.bikeId));
 
       for (const finding of overdue) {
+        // Overdue but not yet lockable (the rider has not been warned long enough): neither
+        // lock nor restore. Keeping it in overdueIds is what stops the restore pass below from
+        // unlocking a bike that is still behind.
+        if (!finding.lockable) {
+          continue;
+        }
         await this.applyArrears(
           finding.bikeId,
           true,
@@ -604,7 +617,7 @@ export class EnforcementService
     }
 
     const now = new Date();
-    await this.prisma.$transaction(async (tx) => {
+    const reviewEventId = await this.prisma.$transaction(async (tx) => {
       await tx.bikeEnforcement.update({
         where: { bikeId: row.bikeId },
         data: {
@@ -627,20 +640,41 @@ export class EnforcementService
         });
       }
 
-      if (flagReview) {
-        await tx.enforcementEvent.create({
-          data: {
-            bikeId: row.bikeId,
-            type: EnforcementEventType.REVIEW_FLAGGED,
-            trigger,
-            fromState: row.confirmedState,
-            toState: row.desiredState,
-            reason: `Immobilize wanted but telemetry cannot be trusted: ${reason}`,
-            telemetry: telemetry ? snapshotJson(telemetry) : undefined,
-          },
-        });
+      if (!flagReview) {
+        return null;
       }
+      const flagged = await tx.enforcementEvent.create({
+        data: {
+          bikeId: row.bikeId,
+          type: EnforcementEventType.REVIEW_FLAGGED,
+          trigger,
+          fromState: row.confirmedState,
+          toState: row.desiredState,
+          reason: `Immobilize wanted but telemetry cannot be trusted: ${reason}`,
+          telemetry: telemetry ? snapshotJson(telemetry) : undefined,
+        },
+        select: { id: true },
+      });
+      return flagged.id;
     });
+
+    if (reviewEventId) {
+      this.announce<EnforcementReviewFlaggedEvent>(ENFORCEMENT_REVIEW_FLAGGED, {
+        bikeId: row.bikeId,
+        enforcementEventId: reviewEventId,
+        reason,
+        flaggedAt: now,
+      });
+    }
+  }
+
+  /** Emits after commit. A listener's failure must never undo or interrupt enforcement. */
+  private announce<T>(name: string, payload: T): void {
+    try {
+      this.events.emit(name, payload);
+    } catch (error) {
+      this.logger.error(`Listener for ${name} failed: ${describe(error)}`);
+    }
   }
 
   private async recordResponse(
@@ -673,7 +707,7 @@ export class EnforcementService
     }
 
     const state = STATE_FOR_COMMAND[command];
-    await this.prisma.$transaction(async (tx) => {
+    const confirmed = await this.prisma.$transaction(async (tx) => {
       await tx.bikeEnforcement.update({
         where: { bikeId },
         data: {
@@ -684,7 +718,7 @@ export class EnforcementService
             : {}),
         },
       });
-      await tx.enforcementEvent.create({
+      return tx.enforcementEvent.create({
         data: {
           bikeId,
           type: EnforcementEventType.STATE_CONFIRMED,
@@ -694,8 +728,24 @@ export class EnforcementService
           reason: 'Device reported its output state',
           deviceResponse: event.text,
         },
+        select: { id: true },
       });
     });
+
+    // Only a real change is news to anyone; a repeated reply confirming the same state is not.
+    if (row.confirmedState !== state) {
+      this.announce<EnforcementStateConfirmedEvent>(
+        ENFORCEMENT_STATE_CONFIRMED,
+        {
+          bikeId,
+          enforcementEventId: confirmed.id,
+          fromState: row.confirmedState,
+          toState: state,
+          desiredSource: row.desiredSource,
+          confirmedAt: event.receivedAt,
+        },
+      );
+    }
   }
 
   private serialize(bikeId: string, task: () => Promise<void>): Promise<void> {
