@@ -50,6 +50,8 @@ export const Permission = {
    * only: a field agent must not move money, least of all onto their own riders' loans.
    */
   PAYMENT_MANAGE: 'payment:manage',
+  /** See rider messages and their delivery, and read and acknowledge staff alerts. */
+  NOTIFICATION_READ: 'notification:read',
 } as const;
 
 export type Permission = (typeof Permission)[keyof typeof Permission];
@@ -72,6 +74,7 @@ const ROLE_PERMISSIONS: Record<StaffRole, readonly Permission[]> = {
     Permission.LOAN_READ_ALL,
     Permission.LOAN_MANAGE,
     Permission.PAYMENT_MANAGE,
+    Permission.NOTIFICATION_READ,
   ],
   [StaffRole.FIELD_AGENT]: [
     Permission.CUSTOMER_CREATE,

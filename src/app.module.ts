@@ -16,6 +16,7 @@ import { AssetsModule } from './assets/assets.module';
 import { CustomersModule } from './customers/customers.module';
 import { LoansModule } from './loans/loans.module';
 import { PaymentsModule } from './payments/payments.module';
+import { NotificationsModule } from './notifications/notifications.module';
 import { type Env, validateEnv } from './config/env.validation';
 
 @Module({
@@ -53,6 +54,7 @@ import { type Env, validateEnv } from './config/env.validation';
     CustomersModule,
     LoansModule,
     PaymentsModule,
+    NotificationsModule,
   ],
   controllers: [AppController],
   providers: [
