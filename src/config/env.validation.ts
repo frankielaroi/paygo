@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { z } from 'zod';
 
 /**
@@ -47,6 +48,66 @@ const port = z.coerce.number().int().positive().max(65535);
 const emptyAsUndefined = <T extends z.ZodType>(schema: T) =>
   z.preprocess((value) => (value === '' ? undefined : value), schema);
 
+/** Express's named ranges for `trust proxy`. */
+const PROXY_RANGE_NAMES = new Set(['loopback', 'linklocal', 'uniquelocal']);
+
+/** "loopback", "10.0.0.5" or "10.0.0.0/8": one entry of a `trust proxy` list. */
+function isProxyAddress(entry: string): boolean {
+  if (PROXY_RANGE_NAMES.has(entry)) {
+    return true;
+  }
+  const [address, bits, ...rest] = entry.split('/');
+  const version = isIP(address);
+  if (version === 0 || rest.length > 0) {
+    return false;
+  }
+  return (
+    bits === undefined ||
+    (/^\d+$/.test(bits) && Number(bits) <= (version === 4 ? 32 : 128))
+  );
+}
+
+/**
+ * Parsed for Express's `trust proxy`: false (the default), a hop count, or the proxies
+ * whose X-Forwarded-For may be believed. "true" is refused: trusting every hop lets any
+ * client name its own IP and so dodge the per-IP login limit.
+ */
+const trustProxy = emptyAsUndefined(
+  z
+    .string()
+    .trim()
+    .superRefine((value, context) => {
+      if (value === 'true') {
+        context.addIssue({
+          code: 'custom',
+          message:
+            'name the proxies (or give a hop count) instead of "true": trusting every hop lets any client choose its own IP',
+        });
+        return;
+      }
+      const valid =
+        value === 'false' ||
+        /^\d+$/.test(value) ||
+        value.split(',').every((entry) => isProxyAddress(entry.trim()));
+      if (!valid) {
+        context.addIssue({
+          code: 'custom',
+          message:
+            'must be "false", a hop count, or comma-separated IPs, CIDRs, loopback, linklocal or uniquelocal',
+        });
+      }
+    })
+    .optional(),
+).transform((value): false | number | string[] => {
+  if (value === undefined || value === 'false') {
+    return false;
+  }
+  if (/^\d+$/.test(value)) {
+    return Number(value) || false;
+  }
+  return value.split(',').map((entry) => entry.trim());
+});
+
 export const envSchema = z
   .object({
     NODE_ENV: z
@@ -82,6 +143,13 @@ export const envSchema = z
       .default(15),
     LOGIN_RATE_LIMIT: z.coerce.number().int().positive().default(10),
     LOGIN_RATE_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+
+    // Proxies whose X-Forwarded-For header is believed. The client IP behind per-IP rate
+    // limits and the IP recorded against refresh tokens come from it. Unset, every request is
+    // attributed to whatever connected directly, so behind the web frontend (which calls this
+    // API from its server) all staff share one login limit. Set it to the frontend's or load
+    // balancer's address; leave it unset when clients connect directly.
+    TRUST_PROXY: trustProxy,
 
     // Device TCP listener. Disabled in tests unless a spec turns it on with port 0, so a test run
     // does not fight the dev server for the port.
