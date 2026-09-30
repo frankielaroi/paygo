@@ -11,6 +11,7 @@ import type { LoginResponseDto } from '../src/auth/dto/login-response.dto';
 import type { Env } from '../src/config/env.validation';
 import type { CustomerDetailDto } from '../src/customers/dto/customer-response.dto';
 import { EnforcementService } from '../src/enforcement/enforcement.service';
+import { NotificationSchedulerService } from '../src/notifications/notification-scheduler.service';
 import type { LoanDetailDto } from '../src/loans/dto/loan.dto';
 import type {
   PaymentDto,
@@ -142,6 +143,21 @@ describe('Loans and payments (e2e)', () => {
 
   const pay = (loanId: string, amount: number, reference = `T${suffix()}`) =>
     webhook({ reference, amount, metadata: { loan_id: loanId } });
+
+  /**
+   * An automatic lock needs a warning sent long enough ago. Sends it the way production does,
+   * then ages it past LOCKOUT_WARNING_LEAD_HOURS.
+   */
+  async function warnedLongAgo(loanId: string): Promise<void> {
+    await app.get(NotificationSchedulerService).sendLockoutWarnings(new Date());
+    const hours = app
+      .get<ConfigService<Env, true>>(ConfigService)
+      .get('LOCKOUT_WARNING_LEAD_HOURS', { infer: true });
+    await prisma.notification.updateMany({
+      where: { loanId, kind: 'LOCKOUT_WARNING' },
+      data: { sentAt: new Date(Date.now() - (hours + 1) * 3_600_000) },
+    });
+  }
 
   async function desiredState(bikeId: string): Promise<string | undefined> {
     const row = await prisma.bikeEnforcement.findUnique({
@@ -373,7 +389,10 @@ describe('Loans and payments (e2e)', () => {
       expect((await loan(onLastGraceDay.id)).balance.overdueMinor).toBe(0);
       expect((await loan(pastGrace.id)).balance.overdueMinor).toBe(100_00);
 
-      // The sweep's SQL must agree with the per-loan rule.
+      // The sweep's SQL must agree with the per-loan rule. Both riders are warned, so only
+      // the overdue rule separates them.
+      await warnedLongAgo(onLastGraceDay.id);
+      await warnedLongAgo(pastGrace.id);
       await enforcement.sweep();
       expect(await desiredState(onLastGraceDay.bikeId)).toBeUndefined();
       expect(await desiredState(pastGrace.bikeId)).toBe('IMMOBILIZED');
@@ -381,6 +400,7 @@ describe('Loans and payments (e2e)', () => {
 
     it('does not count a partial payment as caught up, and restores only once fully covered', async () => {
       const created = await createLoan({ firstDueDate: day(-2) }); // two installments overdue
+      await warnedLongAgo(created.id);
       await enforcement.sweep();
       expect(await desiredState(created.bikeId)).toBe('IMMOBILIZED');
 
@@ -407,6 +427,7 @@ describe('Loans and payments (e2e)', () => {
 
     it('completes a fully settled loan and leaves it out of the sweep', async () => {
       const created = await createLoan({ firstDueDate: day(-10) });
+      await warnedLongAgo(created.id);
       await enforcement.sweep();
       expect(await desiredState(created.bikeId)).toBe('IMMOBILIZED');
 
