@@ -80,6 +80,22 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
   UNALLOCATED and held in the ledger until staff allocate it. Manual payments
   (`POST /loans/:id/payments`) are refused outright instead. Processing is inline for now;
   when BullMQ lands the webhook should enqueue.
+- Notifications (`src/notifications/`): rider SMS through a `MessageChannel` abstraction
+  (Arkesel today; the log channel in development; in production without a key, a channel
+  that sends nothing), payment reminders and pre-lockout warnings from a scheduler, lock and
+  unlock messages from enforcement's events, staff alerts (`/staff-alerts`), and delivery
+  reports at `/webhooks/arkesel/:token` (Arkesel does not sign callbacks, so the path carries
+  a secret). Every message is recorded before it is sent and is unique on a `dedupeKey` naming
+  the event, so a repeated event never messages twice.
+  **The warning gate:** the arrears sweep only locks a bike whose rider was warned about a
+  still-unpaid installment at least `LOCKOUT_WARNING_LEAD_HOURS` ago (`OverdueBike.lockable`,
+  computed in the arrears SQL). An overdue bike that is not lockable is neither locked nor
+  restored. A send refused for the rider's number (`rejected`) counts as warned, so a bad number
+  cannot dodge enforcement, and staff are alerted. A provider outage or bad credentials
+  (`unavailable`) never counts: the warning stays pending and the lock waits. Keep that
+  distinction in any new channel.
+  Enforcement announces `enforcement.state-confirmed` and `enforcement.review-flagged`
+  (`enforcement.events.ts`) after commit and knows nothing of who listens.
 
 **Not built yet:** plans, initiating Paystack charges (the webhook expects `metadata.loan_id`),
 write-offs and reversals, refunds of rider credit, Redis/BullMQ,
@@ -711,6 +727,14 @@ Expected variables:
 | `ENFORCEMENT_COMMAND_RETRY_SECONDS` | Wait for a device reply before resending a command (default 300) |
 | `ENFORCEMENT_SWEEP_INTERVAL_SECONDS` | Arrears sweep and retry interval (default 900) |
 | `PAYSTACK_SECRET_KEY` | Verifies Paystack webhook signatures; without it the webhook refuses every request |
+| `ARKESEL_API_KEY` | Rider SMS. Unset: log only in development, nothing sent in production (so no automatic locks) |
+| `ARKESEL_SENDER_ID` / `ARKESEL_SANDBOX` | Registered sender name (default `PayGo`); sandbox sends are not delivered |
+| `ARKESEL_CALLBACK_BASE_URL` / `ARKESEL_CALLBACK_TOKEN` | Public URL and secret path token for delivery reports |
+| `NOTIFICATIONS_ENABLED` / `NOTIFICATIONS_INTERVAL_SECONDS` | The reminder, warning and retry scheduler (default on, every 300s; off in e2e) |
+| `PAYMENT_REMINDER_LEAD_DAYS` | Days before a due date to remind; 0 disables (default 1, so daily loans get a daily reminder) |
+| `LOCKOUT_WARNING_LEAD_HOURS` | How long before an automatic lock the rider must have been warned (default 12) |
+| `RIDER_MESSAGE_START_HOUR` / `RIDER_MESSAGE_END_HOUR` | UTC hours for reminders and warnings (default 7 to 20); lock and unlock messages go any time |
+| `NOTIFICATION_MAX_ATTEMPTS` | Failed sends before staff are alerted that a message is stuck (default 3); retries continue |
 
 There is deliberately no restore threshold variable: the catch-up rule is "nothing past grace
 owed", with no tolerance. Changing that is a business decision, and belongs in `overdueMinor`
