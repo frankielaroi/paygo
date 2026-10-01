@@ -22,6 +22,7 @@ import {
 } from 'class-validator';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { ContactType, CustomerStatus } from '../../generated/prisma/enums';
+import { RIDER_STANDINGS, type RiderStanding } from '../rider-standing';
 
 /** Spaces, dashes, dots and brackets are how people write numbers, not part of them. */
 export function normalizePhone(value: string): string {
@@ -211,6 +212,15 @@ export class CustomerQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsEnum(CustomerStatus)
   status?: CustomerStatus;
+
+  @ApiPropertyOptional({
+    enum: RIDER_STANDINGS,
+    description:
+      'active, overdue, or no-bike (see CustomerSummaryDto.standing)',
+  })
+  @IsOptional()
+  @IsIn(RIDER_STANDINGS)
+  standing?: RiderStanding;
 
   @ApiPropertyOptional({ enum: CUSTOMER_SORT_FIELDS, default: 'createdAt' })
   @IsOptional()

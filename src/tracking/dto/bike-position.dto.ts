@@ -33,6 +33,20 @@ export class BikePositionDataDto {
 
   @ApiProperty()
   hasFix!: boolean;
+
+  @ApiProperty({
+    nullable: true,
+    description:
+      'Pack voltage in mV (Teltonika IO 66). Null when not reported.',
+  })
+  externalVoltageMv!: number | null;
+
+  @ApiProperty({
+    nullable: true,
+    description:
+      'Tracker total odometer in metres (Teltonika IO 16). Null when not reported.',
+  })
+  odometerMeters!: number | null;
 }
 
 export class BikePositionDto extends BikePositionDataDto {
