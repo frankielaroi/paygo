@@ -21,6 +21,9 @@ datasource db {
 enum StaffRole {
   ADMIN
   FIELD_AGENT
+  /// Collections: reads riders, bikes and loans, records and allocates payments. No lending,
+  /// no enforcement, no staff management.
+  FINANCE
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +42,15 @@ model User {
   branch       String?
   isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
+
+  /// Set when an admin creates the account or resets its password: the account can do nothing
+  /// but change its password until it does, so a temporary password never stays in use.
+  mustChangePassword Boolean   @default(false)
+  passwordChangedAt  DateTime?
+
+  /// Staff are deactivated, never deleted, so every audit row naming them stays readable.
+  deactivatedAt      DateTime?
+  deactivationReason String?
 
   /// Per-account brute force protection, independent of the IP rate limit. Reset on a
   /// successful login. Short lockouts on purpose: a long one lets an attacker who knows an
@@ -70,6 +82,8 @@ model User {
   paymentsRecorded        Payment[]                 @relation("PaymentRecordedBy")
   paymentsAllocated       Payment[]                 @relation("PaymentAllocatedBy")
   staffAlertsAcknowledged StaffAlert[]              @relation("StaffAlertAcknowledgedBy")
+  staffEventsActed        StaffAuditEvent[]         @relation("StaffAuditActor")
+  staffEventsReceived     StaffAuditEvent[]         @relation("StaffAuditTarget")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -348,20 +362,24 @@ model BikeStatusChange {
 /// idempotent, while server receive time remains separate for online/offline calculations.
 /// Restrict, not Cascade: bikes are retired, never deleted, and history must not vanish.
 model BikePosition {
-  id         String   @id @default(uuid()) @db.Uuid
-  bikeId     String   @db.Uuid
-  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Restrict)
-  recordedAt DateTime
-  receivedAt DateTime
-  latitude   Float
-  longitude  Float
-  altitude   Int
-  angle      Int
-  satellites Int
-  speed      Int
-  ignition   Boolean?
-  movement   Boolean?
-  hasFix     Boolean
+  id                String   @id @default(uuid()) @db.Uuid
+  bikeId            String   @db.Uuid
+  bike              Bike     @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+  recordedAt        DateTime
+  receivedAt        DateTime
+  latitude          Float
+  longitude         Float
+  altitude          Int
+  angle             Int
+  satellites        Int
+  speed             Int
+  ignition          Boolean?
+  movement          Boolean?
+  hasFix            Boolean
+  /// Pack voltage in mV (Teltonika IO 66). Null when the device did not report it.
+  externalVoltageMv Int?
+  /// Tracker total odometer in metres (Teltonika IO 16). Null when not reported.
+  odometerMeters    Int?
 
   @@unique([bikeId, recordedAt])
   @@index([bikeId, recordedAt])
@@ -370,19 +388,23 @@ model BikePosition {
 
 /// One latest known telemetry snapshot per bike, maintained only when an event is newer.
 model BikeCurrentPosition {
-  bikeId     String   @id @db.Uuid
-  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
-  recordedAt DateTime
-  receivedAt DateTime
-  latitude   Float
-  longitude  Float
-  altitude   Int
-  angle      Int
-  satellites Int
-  speed      Int
-  ignition   Boolean?
-  movement   Boolean?
-  hasFix     Boolean
+  bikeId            String   @id @db.Uuid
+  bike              Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
+  recordedAt        DateTime
+  receivedAt        DateTime
+  latitude          Float
+  longitude         Float
+  altitude          Int
+  angle             Int
+  satellites        Int
+  speed             Int
+  ignition          Boolean?
+  movement          Boolean?
+  hasFix            Boolean
+  /// Pack voltage in mV (Teltonika IO 66). Null when the device did not report it.
+  externalVoltageMv Int?
+  /// Tracker total odometer in metres (Teltonika IO 16). Null when not reported.
+  odometerMeters    Int?
 
   @@index([receivedAt])
   @@map("bike_current_positions")
@@ -788,4 +810,36 @@ model StaffAlert {
 
   @@index([acknowledgedAt, createdAt])
   @@map("staff_alerts")
+}
+
+// ---------------------------------------------------------------------------
+// Staff administration
+// ---------------------------------------------------------------------------
+
+enum StaffAuditEventType {
+  ACCOUNT_CREATED
+  PROFILE_UPDATED
+  ROLE_CHANGED
+  DEACTIVATED
+  REACTIVATED
+  PASSWORD_RESET
+  PASSWORD_CHANGED
+}
+
+/// Append-only record of every change to a staff account and who made it. Changes to who can
+/// do what are exactly the changes that must be traceable afterwards.
+model StaffAuditEvent {
+  id           String              @id @default(uuid()) @db.Uuid
+  type         StaffAuditEventType
+  actorUserId  String              @db.Uuid
+  actor        User                @relation("StaffAuditActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+  targetUserId String              @db.Uuid
+  target       User                @relation("StaffAuditTarget", fields: [targetUserId], references: [id], onDelete: Restrict)
+  /// What changed, as before and after values. Never a password or hash.
+  detail       Json?
+  createdAt    DateTime            @default(now())
+
+  @@index([actorUserId, createdAt])
+  @@index([targetUserId, createdAt])
+  @@map("staff_audit_events")
 }
