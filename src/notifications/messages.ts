@@ -53,6 +53,21 @@ export function reminderText(
 }
 
 /**
+ * A reminder staff send by hand from the overdue queue. Worded as a nudge, not a threat: the
+ * formal warning, with its deadline, is what the scheduler sends before any lock.
+ */
+export function overdueReminderText(
+  rider: RiderContext,
+  overdueMinor: number,
+  currency: string,
+): string {
+  return (
+    `Hi ${rider.firstName}, ${formatMoney(overdueMinor, currency)} on bike ` +
+    `${rider.bikeName} is overdue. Please pay today to keep riding. Already paid? Ignore this.`
+  );
+}
+
+/**
  * The pre-lockout warning. States the amount, the last day to pay, and the consequence, and
  * tells a rider who has just paid to ignore it, since a payment can cross with the message.
  */

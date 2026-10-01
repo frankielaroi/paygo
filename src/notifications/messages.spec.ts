@@ -3,6 +3,7 @@ import {
   formatMoney,
   immobilizedText,
   lockoutWarningText,
+  overdueReminderText,
   reminderText,
   restoredText,
   toMsisdn,
@@ -45,6 +46,7 @@ describe('rider messages', () => {
     immobilizedText(rider, { kind: 'staff' }),
     restoredText(rider, true),
     restoredText(rider, false),
+    overdueReminderText(rider, 4500, 'GHS'),
   ];
 
   it('states the amount and the due date in a reminder', () => {
