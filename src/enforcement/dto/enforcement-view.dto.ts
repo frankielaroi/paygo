@@ -65,6 +65,14 @@ export class EnforcementEventDto {
   })
   actorUserId!: string | null;
 
+  @ApiProperty({
+    nullable: true,
+    example: 'Kwame Asante (deactivated)',
+    description:
+      'Who acted, still shown after their account is deactivated. Null for automatic actions.',
+  })
+  actorName!: string | null;
+
   @ApiProperty()
   trigger!: string;
 

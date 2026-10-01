@@ -19,10 +19,7 @@ import {
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { RequirePermissions } from '../common/decorators/permissions.decorator';
 import type { AuthenticatedStaff } from '../common/types/authenticated-staff';
-import type {
-  BikeEnforcement,
-  EnforcementEvent,
-} from '../generated/prisma/client';
+import type { BikeEnforcement } from '../generated/prisma/client';
 import { Permission } from '../users/enums/role.enum';
 import {
   EnforcementEventDto,
@@ -46,6 +43,7 @@ export class EnforcementController {
   constructor(private readonly enforcement: EnforcementService) {}
 
   @Get('review')
+  @RequirePermissions(Permission.ASSET_IMMOBILIZE_ANY)
   @ApiOperation({
     summary:
       'Bikes where an immobilize is wanted but telemetry is missing, stale or offline',
@@ -61,11 +59,18 @@ export class EnforcementController {
     summary: 'Desired and confirmed state, with recent audit events',
   })
   @ApiOkResponse({ type: EnforcementViewDto })
-  @ApiNotFoundResponse({ description: 'Bike not found' })
+  @ApiNotFoundResponse({
+    description:
+      'Bike not found, or (field agents) not held by one of your riders',
+  })
   async get(
     @Param('bikeId', ParseUUIDPipe) bikeId: string,
+    @CurrentUser() user: AuthenticatedStaff,
   ): Promise<EnforcementViewDto> {
-    return toViewDto(bikeId, await this.enforcement.getEnforcement(bikeId));
+    return toViewDto(
+      bikeId,
+      await this.enforcement.getEnforcement(bikeId, user),
+    );
   }
 
   @Post('bikes/:bikeId/desired-state')
@@ -74,10 +79,14 @@ export class EnforcementController {
     summary: 'Manually lock or unlock a bike',
     description:
       'Sets the desired state; it does not send a command directly. An immobilize is sent ' +
-      'only once the stationary interlock passes, so the response may show it deferred.',
+      'only once the stationary interlock passes, so the response may show it deferred. ' +
+      'Field agents may act only on bikes held by riders assigned to them.',
   })
   @ApiOkResponse({ type: EnforcementViewDto })
-  @ApiNotFoundResponse({ description: 'Bike not found' })
+  @ApiNotFoundResponse({
+    description:
+      'Bike not found, or (field agents) not held by one of your riders',
+  })
   async setDesiredState(
     @Param('bikeId', ParseUUIDPipe) bikeId: string,
     @Body() input: SetDesiredStateDto,
@@ -88,7 +97,7 @@ export class EnforcementController {
       await this.enforcement.setDesiredStateByStaff(
         bikeId,
         input.state,
-        user.id,
+        user,
         input.reason,
       ),
     );
@@ -110,11 +119,16 @@ function toStateDto(row: BikeEnforcement): EnforcementStateDto {
   };
 }
 
-function toEventDto(event: EnforcementEvent): EnforcementEventDto {
+function toEventDto(
+  event: EnforcementView['events'][number],
+): EnforcementEventDto {
   return {
     id: event.id,
     type: event.type,
     actorUserId: event.actorUserId,
+    actorName: event.actor
+      ? `${event.actor.firstName} ${event.actor.lastName}${event.actor.isActive ? '' : ' (deactivated)'}`
+      : null,
     trigger: event.trigger,
     fromState: event.fromState,
     toState: event.toState,

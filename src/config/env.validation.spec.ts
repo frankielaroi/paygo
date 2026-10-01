@@ -77,6 +77,20 @@ describe('validateEnv', () => {
     ).toBe(false);
   });
 
+  it('defaults the battery range to a 48 V lithium pack and refuses an inverted one', () => {
+    const env = validateEnv(valid);
+    expect(env.BIKE_BATTERY_EMPTY_MV).toBe(42000);
+    expect(env.BIKE_BATTERY_FULL_MV).toBe(54600);
+
+    expect(() =>
+      validateEnv({
+        ...valid,
+        BIKE_BATTERY_EMPTY_MV: '54600',
+        BIKE_BATTERY_FULL_MV: '42000',
+      }),
+    ).toThrow(/BIKE_BATTERY_FULL_MV: must be higher/);
+  });
+
   describe('TRUST_PROXY', () => {
     const trustProxy = (value?: string) =>
       validateEnv({ ...valid, TRUST_PROXY: value }).TRUST_PROXY;

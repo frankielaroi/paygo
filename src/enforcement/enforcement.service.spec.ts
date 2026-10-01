@@ -1,6 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import type { EventEmitter2 } from '@nestjs/event-emitter';
 import { Subject } from 'rxjs';
+import type { AuthenticatedStaff } from '../common/types/authenticated-staff';
 import type { Env } from '../config/env.validation';
 import type {
   BikeEnforcement,
@@ -10,6 +11,7 @@ import {
   DesiredStateSource,
   EnforcementEventType,
   MobilityState,
+  StaffRole,
 } from '../generated/prisma/enums';
 import type { PrismaService } from '../prisma/prisma.service';
 import type {
@@ -33,6 +35,13 @@ import { EnforcementService } from './enforcement.service';
 const BIKE_ID = '00000000-0000-4000-8000-000000000001';
 const IMEI = '356307042441013';
 const ADMIN_ID = '00000000-0000-4000-8000-0000000000aa';
+const ADMIN: AuthenticatedStaff = {
+  kind: 'staff',
+  id: ADMIN_ID,
+  email: 'admin@paygo.test',
+  role: StaffRole.ADMIN,
+  mustChangePassword: false,
+};
 
 type Where = Record<string, unknown>;
 
@@ -533,7 +542,7 @@ describe('EnforcementService', () => {
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.MOBILE,
-        ADMIN_ID,
+        ADMIN,
         'Unlock requested by branch',
       );
 
@@ -641,7 +650,7 @@ describe('EnforcementService', () => {
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.IMMOBILIZED,
-        ADMIN_ID,
+        ADMIN,
         'Reported stolen',
       );
 
@@ -671,7 +680,7 @@ describe('EnforcementService', () => {
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.IMMOBILIZED,
-        ADMIN_ID,
+        ADMIN,
         'Reported stolen',
       );
 
@@ -687,13 +696,13 @@ describe('EnforcementService', () => {
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.MOBILE,
-        ADMIN_ID,
+        ADMIN,
         'Checking',
       );
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.MOBILE,
-        ADMIN_ID,
+        ADMIN,
         'Checking again',
       );
 

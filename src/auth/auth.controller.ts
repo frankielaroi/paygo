@@ -6,7 +6,6 @@ import {
   HttpStatus,
   Post,
 } from '@nestjs/common';
-import { Throttle } from '@nestjs/throttler';
 import {
   ApiBearerAuth,
   ApiNoContentResponse,
@@ -18,7 +17,9 @@ import {
 } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { CredentialThrottle } from '../common/decorators/credential-throttle.decorator';
 import { Public } from '../common/decorators/public.decorator';
+import { AllowPendingPasswordChange } from '../common/decorators/allow-pending-password-change.decorator';
 import {
   RequestMeta,
   type RequestContext,
@@ -38,7 +39,7 @@ export class AuthController {
   @Public()
   // Tighter than the global limit. Named 'login' so it draws from its own bucket rather
   // than sharing one with ordinary traffic.
-  @Throttle({ login: {} })
+  @CredentialThrottle()
   @Post('login')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
@@ -59,7 +60,7 @@ export class AuthController {
   }
 
   @Public()
-  @Throttle({ login: {} })
+  @CredentialThrottle()
   @Post('refresh')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
@@ -96,6 +97,7 @@ export class AuthController {
   }
 
   @Get('me')
+  @AllowPendingPasswordChange()
   @ApiBearerAuth('bearer')
   @ApiOperation({
     summary: 'The current principal',

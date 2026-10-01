@@ -13,12 +13,14 @@ const admin: AuthenticatedStaff = {
   id: 'a',
   email: 'a@paygo.test',
   role: StaffRole.ADMIN,
+  mustChangePassword: false,
 };
 const agent: AuthenticatedStaff = {
   kind: 'staff',
   id: 'b',
   email: 'b@paygo.test',
   role: StaffRole.FIELD_AGENT,
+  mustChangePassword: false,
 };
 
 function contextWith(user?: unknown): ExecutionContext {
@@ -29,17 +31,20 @@ function contextWith(user?: unknown): ExecutionContext {
   } as unknown as ExecutionContext;
 }
 
-/** Stubs the three metadata lookups the guard makes, in order. */
+/** Stubs the metadata lookups the guard makes, by key. */
 function guardWith(meta: {
   isPublic?: boolean;
   roles?: StaffRole[];
   permissions?: Permission[];
+  allowPendingPasswordChange?: boolean;
 }): RolesGuard {
   const reflector = {
     getAllAndOverride: jest.fn((key: string) => {
       if (key === 'isPublic') return meta.isPublic;
       if (key === 'roles') return meta.roles;
       if (key === 'permissions') return meta.permissions;
+      if (key === 'allowPendingPasswordChange')
+        return meta.allowPendingPasswordChange;
       return undefined;
     }),
   } as unknown as Reflector;
@@ -47,6 +52,36 @@ function guardWith(meta: {
 }
 
 describe('RolesGuard', () => {
+  describe('an account holding a temporary password', () => {
+    const pending: AuthenticatedStaff = { ...admin, mustChangePassword: true };
+
+    it('is refused on a route with no requirements at all', () => {
+      expect(() => guardWith({}).canActivate(contextWith(pending))).toThrow(
+        ForbiddenException,
+      );
+    });
+
+    it('is refused even where its role would otherwise be enough', () => {
+      expect(() =>
+        guardWith({ roles: [StaffRole.ADMIN] }).canActivate(
+          contextWith(pending),
+        ),
+      ).toThrow(ForbiddenException);
+    });
+
+    it('may use a route marked for changing the password', () => {
+      expect(
+        guardWith({ allowPendingPasswordChange: true }).canActivate(
+          contextWith(pending),
+        ),
+      ).toBe(true);
+    });
+
+    it('does not affect an account with a real password', () => {
+      expect(guardWith({}).canActivate(contextWith(admin))).toBe(true);
+    });
+  });
+
   it('allows a public route with no principal', () => {
     expect(guardWith({ isPublic: true }).canActivate(contextWith())).toBe(true);
   });
@@ -73,11 +108,13 @@ describe('RolesGuard', () => {
     ).toThrow(ForbiddenException);
   });
 
-  it('denies a field agent the immobilize permission', () => {
+  // Field agents may lock and unlock their own riders' bikes (granted deliberately, scoped in
+  // the enforcement service), but never any bike.
+  it('denies a field agent immobilizing any bike', () => {
     expect(() =>
-      guardWith({ permissions: [Permission.ASSET_IMMOBILIZE] }).canActivate(
-        contextWith(agent),
-      ),
+      guardWith({
+        permissions: [Permission.ASSET_IMMOBILIZE_ANY],
+      }).canActivate(contextWith(agent)),
     ).toThrow(ForbiddenException);
   });
 

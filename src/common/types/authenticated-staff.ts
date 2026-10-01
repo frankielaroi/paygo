@@ -10,4 +10,10 @@ export interface AuthenticatedStaff {
   id: string;
   email: string;
   role: StaffRole;
+  /**
+   * The account holds a temporary password set by an admin. Read from the database on every
+   * request, like the role, and enforced by RolesGuard: only routes marked
+   * @AllowPendingPasswordChange() are reachable until the password is changed.
+   */
+  mustChangePassword: boolean;
 }

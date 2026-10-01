@@ -166,6 +166,21 @@ export const envSchema = z
       .max(86400)
       .default(300),
 
+    // Battery % is estimated from pack voltage (Teltonika IO 66) between these two readings.
+    // Defaults suit a 48 V lithium pack (13S: 3.23 V/cell empty, 4.2 V/cell full).
+    BIKE_BATTERY_EMPTY_MV: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(200000)
+      .default(42000),
+    BIKE_BATTERY_FULL_MV: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(200000)
+      .default(54600),
+
     // Enforcement interlock. How long a bike must have been stopped (speed 0, ignition off, with
     // a GPS fix) before it may be immobilized, and how old its latest reading may be. A tracker's
     // "on stop" report period must be shorter than the maximum age, or a parked bike never has
@@ -272,6 +287,13 @@ export const envSchema = z
         code: 'custom',
         path: ['ARKESEL_CALLBACK_TOKEN'],
         message: 'required when ARKESEL_CALLBACK_BASE_URL is set',
+      });
+    }
+    if (env.BIKE_BATTERY_EMPTY_MV >= env.BIKE_BATTERY_FULL_MV) {
+      context.addIssue({
+        code: 'custom',
+        path: ['BIKE_BATTERY_FULL_MV'],
+        message: 'must be higher than BIKE_BATTERY_EMPTY_MV',
       });
     }
     if (env.RIDER_MESSAGE_START_HOUR >= env.RIDER_MESSAGE_END_HOUR) {

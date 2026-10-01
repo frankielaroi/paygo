@@ -20,7 +20,9 @@ import type {
   EnforcementEvent,
   Prisma,
 } from '../generated/prisma/client';
+import type { AuthenticatedStaff } from '../common/types/authenticated-staff';
 import { PrismaService } from '../prisma/prisma.service';
+import { Permission, roleHasPermission } from '../users/enums/role.enum';
 import {
   commandFromResponse,
   type DeviceCommand,
@@ -69,7 +71,11 @@ export type ReconcileTrigger =
 
 export interface EnforcementView {
   state: BikeEnforcement | null;
-  events: EnforcementEvent[];
+  events: Array<
+    EnforcementEvent & {
+      actor: { firstName: string; lastName: string; isActive: boolean } | null;
+    }
+  >;
 }
 
 type BlockReason = string;
@@ -153,19 +159,19 @@ export class EnforcementService
   async setDesiredStateByStaff(
     bikeId: string,
     state: MobilityState,
-    userId: string,
+    actor: AuthenticatedStaff,
     reason: string,
   ): Promise<EnforcementView> {
-    await this.requireBike(bikeId);
+    await this.requireBikeFor(bikeId, actor);
     await this.writeDesiredState(
       bikeId,
       state,
-      { kind: 'staff', userId },
+      { kind: 'staff', userId: actor.id },
       reason,
       null,
     );
     await this.reconcile(bikeId, 'staff');
-    return this.getEnforcement(bikeId);
+    return this.getEnforcement(bikeId, actor);
   }
 
   /**
@@ -309,14 +315,23 @@ export class EnforcementService
     await this.reconcile(bike.id, 'command-response');
   }
 
-  async getEnforcement(bikeId: string): Promise<EnforcementView> {
-    await this.requireBike(bikeId);
+  async getEnforcement(
+    bikeId: string,
+    actor: AuthenticatedStaff,
+  ): Promise<EnforcementView> {
+    await this.requireBikeFor(bikeId, actor);
     const [state, events] = await Promise.all([
       this.prisma.bikeEnforcement.findUnique({ where: { bikeId } }),
       this.prisma.enforcementEvent.findMany({
         where: { bikeId },
         orderBy: { createdAt: 'desc' },
         take: 50,
+        // The actor's name, active or not: a deactivated account still owns what it did.
+        include: {
+          actor: {
+            select: { firstName: true, lastName: true, isActive: true },
+          },
+        },
       }),
     ]);
     return { state, events };
@@ -787,12 +802,34 @@ export class EnforcementService
     }
   }
 
-  private async requireBike(bikeId: string): Promise<void> {
+  /**
+   * A bike the caller may see and act on. With ASSET_IMMOBILIZE_ANY, any bike; otherwise (field
+   * agents) only a bike whose current rider is assigned to them. Anything else is a 404, so the
+   * endpoint does not confirm a bike exists to someone who may not touch it.
+   */
+  private async requireBikeFor(
+    bikeId: string,
+    actor: AuthenticatedStaff,
+  ): Promise<void> {
     const bike = await this.prisma.bike.findUnique({
       where: { id: bikeId },
       select: { id: true },
     });
     if (!bike) {
+      throw new NotFoundException('Bike not found');
+    }
+    if (roleHasPermission(actor.role, Permission.ASSET_IMMOBILIZE_ANY)) {
+      return;
+    }
+    const held = await this.prisma.bikeAssignment.findFirst({
+      where: {
+        bikeId,
+        endedAt: null,
+        customer: { assignedAgentId: actor.id },
+      },
+      select: { id: true },
+    });
+    if (!held) {
       throw new NotFoundException('Bike not found');
     }
   }
