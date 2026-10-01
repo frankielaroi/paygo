@@ -8,3 +8,6 @@ process.env.PAYSTACK_SECRET_KEY ??= 'sk_test_e2e_only_not_a_real_key';
 process.env.ARKESEL_API_KEY = '';
 process.env.NOTIFICATIONS_ENABLED = 'false';
 process.env.ARKESEL_CALLBACK_TOKEN ??= 'e2e-callback-token-0123456789abcdef';
+// Staff-sent reminders respect messaging hours; a test run must not depend on the time of day.
+process.env.RIDER_MESSAGE_START_HOUR = '0';
+process.env.RIDER_MESSAGE_END_HOUR = '24';
