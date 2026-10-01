@@ -21,6 +21,9 @@ datasource db {
 enum StaffRole {
   ADMIN
   FIELD_AGENT
+  /// Collections: reads riders, bikes and loans, records and allocates payments. No lending,
+  /// no enforcement, no staff management.
+  FINANCE
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +42,15 @@ model User {
   branch       String?
   isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
+
+  /// Set when an admin creates the account or resets its password: the account can do nothing
+  /// but change its password until it does, so a temporary password never stays in use.
+  mustChangePassword Boolean   @default(false)
+  passwordChangedAt  DateTime?
+
+  /// Staff are deactivated, never deleted, so every audit row naming them stays readable.
+  deactivatedAt      DateTime?
+  deactivationReason String?
 
   /// Per-account brute force protection, independent of the IP rate limit. Reset on a
   /// successful login. Short lockouts on purpose: a long one lets an attacker who knows an
@@ -60,15 +72,18 @@ model User {
   refreshTokens      RefreshToken[]
   enforcementActions EnforcementEvent[]
 
-  trackersInstalled    BikeTrackerInstallation[] @relation("TrackerInstalledBy")
-  trackersRemoved      BikeTrackerInstallation[] @relation("TrackerRemovedBy")
-  bikesAssigned        BikeAssignment[]          @relation("BikeAssignedBy")
-  bikeAssignmentsEnded BikeAssignment[]          @relation("BikeAssignmentEndedBy")
-  bikeStatusChanges    BikeStatusChange[]        @relation("BikeStatusChangedBy")
-  loansCreated         Loan[]                    @relation("LoanCreatedBy")
-  loansClosed          Loan[]                    @relation("LoanClosedBy")
-  paymentsRecorded     Payment[]                 @relation("PaymentRecordedBy")
-  paymentsAllocated    Payment[]                 @relation("PaymentAllocatedBy")
+  trackersInstalled       BikeTrackerInstallation[] @relation("TrackerInstalledBy")
+  trackersRemoved         BikeTrackerInstallation[] @relation("TrackerRemovedBy")
+  bikesAssigned           BikeAssignment[]          @relation("BikeAssignedBy")
+  bikeAssignmentsEnded    BikeAssignment[]          @relation("BikeAssignmentEndedBy")
+  bikeStatusChanges       BikeStatusChange[]        @relation("BikeStatusChangedBy")
+  loansCreated            Loan[]                    @relation("LoanCreatedBy")
+  loansClosed             Loan[]                    @relation("LoanClosedBy")
+  paymentsRecorded        Payment[]                 @relation("PaymentRecordedBy")
+  paymentsAllocated       Payment[]                 @relation("PaymentAllocatedBy")
+  staffAlertsAcknowledged StaffAlert[]              @relation("StaffAlertAcknowledgedBy")
+  staffEventsActed        StaffAuditEvent[]         @relation("StaffAuditActor")
+  staffEventsReceived     StaffAuditEvent[]         @relation("StaffAuditTarget")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -167,6 +182,8 @@ model Customer {
   /// they exist; until then this is the rider's financing history.
   bikeAssignments BikeAssignment[]
   loans           Loan[]
+  notifications   Notification[]
+  staffAlerts     StaffAlert[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -254,6 +271,8 @@ model Bike {
   assignments          BikeAssignment[]
   statusChanges        BikeStatusChange[]
   loans                Loan[]
+  notifications        Notification[]
+  staffAlerts          StaffAlert[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -343,20 +362,24 @@ model BikeStatusChange {
 /// idempotent, while server receive time remains separate for online/offline calculations.
 /// Restrict, not Cascade: bikes are retired, never deleted, and history must not vanish.
 model BikePosition {
-  id         String   @id @default(uuid()) @db.Uuid
-  bikeId     String   @db.Uuid
-  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Restrict)
-  recordedAt DateTime
-  receivedAt DateTime
-  latitude   Float
-  longitude  Float
-  altitude   Int
-  angle      Int
-  satellites Int
-  speed      Int
-  ignition   Boolean?
-  movement   Boolean?
-  hasFix     Boolean
+  id                String   @id @default(uuid()) @db.Uuid
+  bikeId            String   @db.Uuid
+  bike              Bike     @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+  recordedAt        DateTime
+  receivedAt        DateTime
+  latitude          Float
+  longitude         Float
+  altitude          Int
+  angle             Int
+  satellites        Int
+  speed             Int
+  ignition          Boolean?
+  movement          Boolean?
+  hasFix            Boolean
+  /// Pack voltage in mV (Teltonika IO 66). Null when the device did not report it.
+  externalVoltageMv Int?
+  /// Tracker total odometer in metres (Teltonika IO 16). Null when not reported.
+  odometerMeters    Int?
 
   @@unique([bikeId, recordedAt])
   @@index([bikeId, recordedAt])
@@ -365,19 +388,23 @@ model BikePosition {
 
 /// One latest known telemetry snapshot per bike, maintained only when an event is newer.
 model BikeCurrentPosition {
-  bikeId     String   @id @db.Uuid
-  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
-  recordedAt DateTime
-  receivedAt DateTime
-  latitude   Float
-  longitude  Float
-  altitude   Int
-  angle      Int
-  satellites Int
-  speed      Int
-  ignition   Boolean?
-  movement   Boolean?
-  hasFix     Boolean
+  bikeId            String   @id @db.Uuid
+  bike              Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
+  recordedAt        DateTime
+  receivedAt        DateTime
+  latitude          Float
+  longitude         Float
+  altitude          Int
+  angle             Int
+  satellites        Int
+  speed             Int
+  ignition          Boolean?
+  movement          Boolean?
+  hasFix            Boolean
+  /// Pack voltage in mV (Teltonika IO 66). Null when the device did not report it.
+  externalVoltageMv Int?
+  /// Tracker total odometer in metres (Teltonika IO 16). Null when not reported.
+  odometerMeters    Int?
 
   @@index([receivedAt])
   @@map("bike_current_positions")
@@ -538,6 +565,7 @@ model Loan {
   payments           Payment[]
   ledgerTransactions LedgerTransaction[]
   ledgerEntries      LedgerEntry[]
+  notifications      Notification[]
 
   updatedAt DateTime @updatedAt
 
@@ -560,7 +588,8 @@ model LoanInstallment {
   /// When it became fully paid.
   paidAt      DateTime?
 
-  allocations PaymentAllocation[]
+  allocations   PaymentAllocation[]
+  notifications Notification[]
 
   @@unique([loanId, sequence])
   @@index([loanId, dueDate])
@@ -687,4 +716,130 @@ model LedgerEntry {
   @@index([transactionId])
   @@index([loanId, account])
   @@map("ledger_entries")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+enum NotificationKind {
+  /// Ahead of a due date.
+  PAYMENT_REMINDER
+  /// Past due, before the bike can be locked. The arrears sweep will not lock until one of these
+  /// was sent (or failed) long enough ago.
+  LOCKOUT_WARNING
+  BIKE_IMMOBILIZED
+  BIKE_RESTORED
+}
+
+enum NotificationStatus {
+  /// Recorded, not yet accepted by the provider (still being attempted).
+  PENDING
+  /// Accepted by the provider. Not proof it reached the phone.
+  SENT
+  /// The provider reported it reached the phone.
+  DELIVERED
+  /// Gave up, or the provider reported it undeliverable. Staff are alerted.
+  FAILED
+}
+
+/// One message to a rider. Unique on dedupeKey, which names the event it is about (an
+/// installment, an enforcement audit row), so the same event can never message a rider twice.
+model Notification {
+  id        String             @id @default(uuid()) @db.Uuid
+  kind      NotificationKind
+  dedupeKey String             @unique
+  status    NotificationStatus @default(PENDING)
+
+  customerId    String           @db.Uuid
+  customer      Customer         @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  loanId        String?          @db.Uuid
+  loan          Loan?            @relation(fields: [loanId], references: [id], onDelete: Restrict)
+  installmentId String?          @db.Uuid
+  installment   LoanInstallment? @relation(fields: [installmentId], references: [id], onDelete: Restrict)
+  bikeId        String?          @db.Uuid
+  bike          Bike?            @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+
+  channel   String
+  recipient String
+  body      String
+
+  providerMessageId String?
+  attempts          Int       @default(0)
+  /// Set while a sender holds the row, so two senders never send the same message.
+  claimedUntil      DateTime?
+  lastError         String?
+
+  createdAt   DateTime  @default(now())
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  failedAt    DateTime?
+
+  @@index([status, createdAt])
+  @@index([customerId, createdAt])
+  @@index([loanId, kind])
+  @@index([providerMessageId])
+  @@map("notifications")
+}
+
+enum StaffAlertKind {
+  /// Enforcement wants to immobilize but cannot trust the telemetry.
+  ENFORCEMENT_REVIEW
+  /// A rider message could not be delivered, so they may not have been warned.
+  NOTIFICATION_FAILED
+}
+
+/// Something a person needs to look at. Unique on dedupeKey, so one cause raises one alert.
+model StaffAlert {
+  id        String         @id @default(uuid()) @db.Uuid
+  kind      StaffAlertKind
+  dedupeKey String         @unique
+  title     String
+  detail    String
+
+  bikeId         String?   @db.Uuid
+  bike           Bike?     @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+  customerId     String?   @db.Uuid
+  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  notificationId String?   @db.Uuid
+
+  createdAt        DateTime  @default(now())
+  acknowledgedAt   DateTime?
+  acknowledgedById String?   @db.Uuid
+  acknowledgedBy   User?     @relation("StaffAlertAcknowledgedBy", fields: [acknowledgedById], references: [id], onDelete: Restrict)
+
+  @@index([acknowledgedAt, createdAt])
+  @@map("staff_alerts")
+}
+
+// ---------------------------------------------------------------------------
+// Staff administration
+// ---------------------------------------------------------------------------
+
+enum StaffAuditEventType {
+  ACCOUNT_CREATED
+  PROFILE_UPDATED
+  ROLE_CHANGED
+  DEACTIVATED
+  REACTIVATED
+  PASSWORD_RESET
+  PASSWORD_CHANGED
+}
+
+/// Append-only record of every change to a staff account and who made it. Changes to who can
+/// do what are exactly the changes that must be traceable afterwards.
+model StaffAuditEvent {
+  id           String              @id @default(uuid()) @db.Uuid
+  type         StaffAuditEventType
+  actorUserId  String              @db.Uuid
+  actor        User                @relation("StaffAuditActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+  targetUserId String              @db.Uuid
+  target       User                @relation("StaffAuditTarget", fields: [targetUserId], references: [id], onDelete: Restrict)
+  /// What changed, as before and after values. Never a password or hash.
+  detail       Json?
+  createdAt    DateTime            @default(now())
+
+  @@index([actorUserId, createdAt])
+  @@index([targetUserId, createdAt])
+  @@map("staff_audit_events")
 }

@@ -21,4 +21,11 @@ export class AuthenticatedStaffDto {
     description: 'Read from the database on every request, not from the token.',
   })
   role!: StaffRole;
+
+  @ApiProperty({
+    description:
+      'True while the account holds a temporary password. Every route except this one, ' +
+      'POST /me/password and logout refuses the account until it is changed.',
+  })
+  mustChangePassword!: boolean;
 }

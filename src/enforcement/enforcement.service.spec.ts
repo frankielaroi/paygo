@@ -1,5 +1,7 @@
 import { ConfigService } from '@nestjs/config';
+import type { EventEmitter2 } from '@nestjs/event-emitter';
 import { Subject } from 'rxjs';
+import type { AuthenticatedStaff } from '../common/types/authenticated-staff';
 import type { Env } from '../config/env.validation';
 import type {
   BikeEnforcement,
@@ -9,6 +11,7 @@ import {
   DesiredStateSource,
   EnforcementEventType,
   MobilityState,
+  StaffRole,
 } from '../generated/prisma/enums';
 import type { PrismaService } from '../prisma/prisma.service';
 import type {
@@ -23,11 +26,22 @@ import type {
   TrackingService,
 } from '../tracking/tracking.service';
 import type { ArrearsSource, OverdueBike } from './arrears-source';
+import {
+  ENFORCEMENT_REVIEW_FLAGGED,
+  ENFORCEMENT_STATE_CONFIRMED,
+} from './enforcement.events';
 import { EnforcementService } from './enforcement.service';
 
 const BIKE_ID = '00000000-0000-4000-8000-000000000001';
 const IMEI = '356307042441013';
 const ADMIN_ID = '00000000-0000-4000-8000-0000000000aa';
+const ADMIN: AuthenticatedStaff = {
+  kind: 'staff',
+  id: ADMIN_ID,
+  email: 'admin@paygo.test',
+  role: StaffRole.ADMIN,
+  mustChangePassword: false,
+};
 
 type Where = Record<string, unknown>;
 
@@ -298,14 +312,16 @@ function setup(overdue: OverdueBike[] = []) {
   const config = {
     get: (key: keyof Env) => settings[key],
   } as unknown as ConfigService<Env, true>;
+  const emit = jest.fn<boolean, [string, unknown]>(() => true);
   const service = new EnforcementService(
     db.client as unknown as PrismaService,
     config,
     tracking as unknown as TrackingService,
     devices as unknown as TcpServerService,
     arrears,
+    { emit } as unknown as EventEmitter2,
   );
-  return { db, devices, tracking, service };
+  return { db, devices, tracking, service, emit };
 }
 
 function reply(service: EnforcementService, text: string): Promise<void> {
@@ -319,9 +335,78 @@ function reply(service: EnforcementService, text: string): Promise<void> {
 const overdueBike: OverdueBike = {
   bikeId: BIKE_ID,
   detail: { daysOverdue: 9, contract: 'C-1' },
+  lockable: true,
 };
 
 describe('EnforcementService', () => {
+  describe('the warning gate', () => {
+    it('does not lock an overdue bike whose rider has not been warned long enough', async () => {
+      const { db, devices, tracking, service } = setup([
+        { ...overdueBike, lockable: false },
+      ]);
+      tracking.parked();
+      devices.connected = new Date(Date.now() - 60_000);
+
+      await service.sweep();
+
+      expect(devices.sendCommand).not.toHaveBeenCalled();
+      expect(db.row()).toBeUndefined();
+    });
+
+    it('does not restore a locked bike that is still overdue but awaiting a new warning', async () => {
+      const findings: OverdueBike[] = [overdueBike];
+      const { db, devices, tracking, service } = setup(findings);
+      tracking.parked();
+      devices.connected = new Date(Date.now() - 60_000);
+      await service.sweep();
+      await reply(service, 'Setdigout 1 OK');
+
+      findings[0] = { ...overdueBike, lockable: false };
+      await service.sweep();
+
+      expect(db.row()?.desiredState).toBe(MobilityState.IMMOBILIZED);
+      expect(devices.commands()).toEqual(['immobilize']);
+    });
+  });
+
+  describe('announcements', () => {
+    type Emitted = [string, { toState?: string; fromState?: string | null }];
+
+    it('announces a confirmed change of state, once, after it is recorded', async () => {
+      const { devices, tracking, service, emit } = setup([overdueBike]);
+      tracking.parked();
+      devices.connected = new Date(Date.now() - 60_000);
+      await service.sweep();
+
+      await reply(service, 'Setdigout 1 OK');
+      await reply(service, 'Setdigout 1 OK'); // same state again: not news
+
+      const confirmed = (emit.mock.calls as Emitted[]).filter(
+        ([name]) => name === ENFORCEMENT_STATE_CONFIRMED,
+      );
+      expect(confirmed).toHaveLength(1);
+      expect(confirmed[0]?.[1]).toMatchObject({
+        fromState: null,
+        toState: MobilityState.IMMOBILIZED,
+      });
+    });
+
+    it('announces a bike flagged for review, once', async () => {
+      const { tracking, service, emit } = setup([overdueBike]);
+      tracking.parked();
+      if (tracking.snapshot) {
+        tracking.snapshot = { ...tracking.snapshot, online: false };
+      }
+
+      await service.sweep();
+      await service.sweep();
+
+      expect(
+        emit.mock.calls.filter(([name]) => name === ENFORCEMENT_REVIEW_FLAGGED),
+      ).toHaveLength(1);
+    });
+  });
+
   describe('the scheduled sweep', () => {
     it('immobilizes an overdue bike that is parked', async () => {
       const { db, devices, tracking, service } = setup([overdueBike]);
@@ -457,7 +542,7 @@ describe('EnforcementService', () => {
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.MOBILE,
-        ADMIN_ID,
+        ADMIN,
         'Unlock requested by branch',
       );
 
@@ -565,7 +650,7 @@ describe('EnforcementService', () => {
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.IMMOBILIZED,
-        ADMIN_ID,
+        ADMIN,
         'Reported stolen',
       );
 
@@ -595,7 +680,7 @@ describe('EnforcementService', () => {
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.IMMOBILIZED,
-        ADMIN_ID,
+        ADMIN,
         'Reported stolen',
       );
 
@@ -611,13 +696,13 @@ describe('EnforcementService', () => {
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.MOBILE,
-        ADMIN_ID,
+        ADMIN,
         'Checking',
       );
       await service.setDesiredStateByStaff(
         BIKE_ID,
         MobilityState.MOBILE,
-        ADMIN_ID,
+        ADMIN,
         'Checking again',
       );
 

@@ -77,6 +77,57 @@ describe('validateEnv', () => {
     ).toBe(false);
   });
 
+  it('defaults the battery range to a 48 V lithium pack and refuses an inverted one', () => {
+    const env = validateEnv(valid);
+    expect(env.BIKE_BATTERY_EMPTY_MV).toBe(42000);
+    expect(env.BIKE_BATTERY_FULL_MV).toBe(54600);
+
+    expect(() =>
+      validateEnv({
+        ...valid,
+        BIKE_BATTERY_EMPTY_MV: '54600',
+        BIKE_BATTERY_FULL_MV: '42000',
+      }),
+    ).toThrow(/BIKE_BATTERY_FULL_MV: must be higher/);
+  });
+
+  describe('TRUST_PROXY', () => {
+    const trustProxy = (value?: string) =>
+      validateEnv({ ...valid, TRUST_PROXY: value }).TRUST_PROXY;
+
+    it('trusts no proxy by default', () => {
+      expect(trustProxy(undefined)).toBe(false);
+      expect(trustProxy('')).toBe(false);
+      expect(trustProxy('false')).toBe(false);
+      expect(trustProxy('0')).toBe(false);
+    });
+
+    it('reads a hop count', () => {
+      expect(trustProxy('1')).toBe(1);
+    });
+
+    it('reads a list of named ranges, addresses and CIDRs', () => {
+      expect(trustProxy('loopback, 10.0.0.5,172.16.0.0/12,::1')).toEqual([
+        'loopback',
+        '10.0.0.5',
+        '172.16.0.0/12',
+        '::1',
+      ]);
+    });
+
+    // Trusting every hop would let any client name its own IP and dodge the login limit.
+    it('refuses "true"', () => {
+      expect(() => trustProxy('true')).toThrow(/instead of "true"/);
+    });
+
+    it.each(['frontend.local', '10.0.0.0/33', '10.0.0.1/8/1', 'loopback,'])(
+      'refuses %s',
+      (value) => {
+        expect(() => trustProxy(value)).toThrow(/TRUST_PROXY/);
+      },
+    );
+  });
+
   it('rejects a seed password that is too short to be worth setting', () => {
     expect(() =>
       validateEnv({ ...valid, SEED_ADMIN_PASSWORD: 'short' }),

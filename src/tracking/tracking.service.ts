@@ -15,6 +15,7 @@ import type { DevicePosition } from '../tcp/codec8-parser';
 import { DEVICE_POSITIONS, type DevicePositionsEvent } from '../tcp/tcp.events';
 import { BikePositionDto } from './dto/bike-position.dto';
 import { BikeStatusDto } from './dto/bike-status.dto';
+import { batteryPercentOf, powerAndOdometerOf } from './telemetry';
 
 /**
  * How far ahead of the server clock a device timestamp may be and still become the current
@@ -140,15 +141,18 @@ export class TrackingService
             return false;
           }
 
+          const latestPower = powerAndOdometerOf(latestRecord.io);
           const affected = await transaction.$executeRaw`
             INSERT INTO "bike_current_positions" (
               "bikeId", "recordedAt", "receivedAt", "latitude", "longitude",
-              "altitude", "angle", "satellites", "speed", "ignition", "movement", "hasFix"
+              "altitude", "angle", "satellites", "speed", "ignition", "movement", "hasFix",
+              "externalVoltageMv", "odometerMeters"
             ) VALUES (
               ${bike.id}::uuid, ${latestRecord.timestamp}, ${event.receivedAt},
               ${latestRecord.latitude}, ${latestRecord.longitude}, ${latestRecord.altitude},
               ${latestRecord.angle}, ${latestRecord.satellites}, ${latestRecord.speed},
-              ${latestRecord.ignition}, ${latestRecord.movement}, ${latestRecord.hasFix}
+              ${latestRecord.ignition}, ${latestRecord.movement}, ${latestRecord.hasFix},
+              ${latestPower.externalVoltageMv}, ${latestPower.odometerMeters}
             )
             ON CONFLICT ("bikeId") DO UPDATE SET
               "recordedAt" = EXCLUDED."recordedAt",
@@ -161,7 +165,9 @@ export class TrackingService
               "speed" = EXCLUDED."speed",
               "ignition" = EXCLUDED."ignition",
               "movement" = EXCLUDED."movement",
-              "hasFix" = EXCLUDED."hasFix"
+              "hasFix" = EXCLUDED."hasFix",
+              "externalVoltageMv" = EXCLUDED."externalVoltageMv",
+              "odometerMeters" = EXCLUDED."odometerMeters"
             WHERE "bike_current_positions"."recordedAt" < EXCLUDED."recordedAt"
           `;
 
@@ -254,6 +260,8 @@ export class TrackingService
         ignition: true,
         movement: true,
         hasFix: true,
+        externalVoltageMv: true,
+        odometerMeters: true,
       },
     });
   }
@@ -408,6 +416,8 @@ export class TrackingService
       ignition: boolean | null;
       movement: boolean | null;
       hasFix: boolean;
+      externalVoltageMv: number | null;
+      odometerMeters: number | null;
     } | null;
   }): BikeStatusDto {
     return {
@@ -417,6 +427,11 @@ export class TrackingService
       registrationNumber: bike.registrationNumber,
       lastReportedAt: bike.lastReportedAt,
       online: this.isOnline(bike.lastReportedAt),
+      batteryPercent: batteryPercentOf(
+        bike.currentPosition?.externalVoltageMv,
+        this.config.get('BIKE_BATTERY_EMPTY_MV', { infer: true }),
+        this.config.get('BIKE_BATTERY_FULL_MV', { infer: true }),
+      ),
       current: bike.currentPosition,
     };
   }
@@ -439,6 +454,7 @@ export class TrackingService
       ignition: record.ignition,
       movement: record.movement,
       hasFix: record.hasFix,
+      ...powerAndOdometerOf(record.io),
     };
   }
 }

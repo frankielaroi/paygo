@@ -38,7 +38,13 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
-      select: { id: true, email: true, role: true, isActive: true },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        isActive: true,
+        mustChangePassword: true,
+      },
     });
 
     if (!user || !user.isActive) {
@@ -56,6 +62,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       // From the database, not the token: a demoted user must not keep their old role
       // until expiry.
       role: user.role,
+      mustChangePassword: user.mustChangePassword,
     };
   }
 }

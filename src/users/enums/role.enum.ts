@@ -33,11 +33,15 @@ export const Permission = {
   /** Add and edit bikes, fit trackers, assign, transfer, repossess, retire. */
   ASSET_MANAGE: 'asset:manage',
   /**
-   * Remote immobilize / restore. Deliberately NOT granted to field agents: an agent in
-   * the field is the most likely person to want it and the least able to verify the bike
-   * is stopped. The safety interlock still applies on top of this permission.
+   * Manual immobilize / restore, limited to bikes held by riders assigned to you (checked in
+   * the enforcement service). Granted to field agents deliberately: CLAUDE.md warns an agent in
+   * the field is the most likely person to want this button and the least able to verify the
+   * bike is stopped, so the stationary interlock applies to their locks exactly as to anyone
+   * else's, and every use is in their activity log.
    */
   ASSET_IMMOBILIZE: 'asset:immobilize',
+  /** Manual immobilize / restore of any bike, and the enforcement review list. */
+  ASSET_IMMOBILIZE_ANY: 'asset:immobilize:any',
   /** Start a loan on a bike already assigned to a rider. */
   LOAN_CREATE: 'loan:create',
   /** Read loans of riders assigned to you (checked in the service). */
@@ -46,10 +50,19 @@ export const Permission = {
   /** Declare a loan defaulted, or repossess the bike under it. */
   LOAN_MANAGE: 'loan:manage',
   /**
-   * Record money by hand, see unallocated payments and allocate them. Moves money, so admin
-   * only: a field agent must not move money, least of all onto their own riders' loans.
+   * Record money by hand, see unallocated payments and allocate them. Admin and finance: a
+   * field agent must not move money, least of all onto their own riders' loans.
    */
   PAYMENT_MANAGE: 'payment:manage',
+  /** See rider messages and their delivery, and read and acknowledge staff alerts. */
+  NOTIFICATION_READ: 'notification:read',
+  /**
+   * The operations dashboard. Everyone has it; what it shows is scoped in the service: without
+   * ASSET_READ (field agents) only bikes held by your own riders.
+   */
+  DASHBOARD_READ: 'dashboard:read',
+  /** Send a rider an overdue reminder by hand from the dashboard. */
+  REMINDER_SEND: 'reminder:send',
 } as const;
 
 export type Permission = (typeof Permission)[keyof typeof Permission];
@@ -67,17 +80,38 @@ const ROLE_PERMISSIONS: Record<StaffRole, readonly Permission[]> = {
     Permission.ASSET_READ,
     Permission.ASSET_MANAGE,
     Permission.ASSET_IMMOBILIZE,
+    Permission.ASSET_IMMOBILIZE_ANY,
     Permission.LOAN_CREATE,
     Permission.LOAN_READ_OWN,
     Permission.LOAN_READ_ALL,
     Permission.LOAN_MANAGE,
     Permission.PAYMENT_MANAGE,
+    Permission.NOTIFICATION_READ,
+    Permission.DASHBOARD_READ,
+    Permission.REMINDER_SEND,
   ],
   [StaffRole.FIELD_AGENT]: [
     Permission.CUSTOMER_CREATE,
     Permission.CUSTOMER_READ_OWN,
     Permission.CUSTOMER_UPDATE,
     Permission.LOAN_READ_OWN,
+    Permission.ASSET_IMMOBILIZE,
+    Permission.DASHBOARD_READ,
+    Permission.REMINDER_SEND,
+  ],
+  // Collections. Reads (the _OWN permissions are what the routes require; _ALL widens the
+  // scope in the service) and moving money onto loans. Cannot lend, change terms, lock bikes,
+  // edit riders or manage staff.
+  [StaffRole.FINANCE]: [
+    Permission.CUSTOMER_READ_OWN,
+    Permission.CUSTOMER_READ_ALL,
+    Permission.ASSET_READ,
+    Permission.LOAN_READ_OWN,
+    Permission.LOAN_READ_ALL,
+    Permission.PAYMENT_MANAGE,
+    Permission.NOTIFICATION_READ,
+    Permission.DASHBOARD_READ,
+    Permission.REMINDER_SEND,
   ],
 };
 

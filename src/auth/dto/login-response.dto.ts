@@ -16,6 +16,12 @@ export class LoggedInUserDto {
 
   @ApiProperty({ enum: StaffRole, enumName: 'StaffRole' })
   role!: StaffRole;
+
+  @ApiProperty({
+    description:
+      'The password is temporary: send the user to POST /me/password before anything else',
+  })
+  mustChangePassword!: boolean;
 }
 
 /** Response shape for a successful login. Never includes the password hash. */

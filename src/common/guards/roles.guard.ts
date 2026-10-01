@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
+import { ALLOW_PENDING_PASSWORD_CHANGE_KEY } from '../decorators/allow-pending-password-change.decorator';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
 import { PERMISSIONS_KEY } from '../decorators/permissions.decorator';
 import { ROLES_KEY } from '../decorators/roles.decorator';
@@ -34,6 +35,23 @@ export class RolesGuard implements CanActivate {
 
     if (this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, targets)) {
       return true;
+    }
+
+    // Before any role check, and on routes with no requirements too: an account holding a
+    // temporary password reaches nothing but the routes that let it change that password.
+    const principal = context
+      .switchToHttp()
+      .getRequest<Request & { user?: AuthenticatedStaff }>().user;
+    if (
+      principal?.mustChangePassword === true &&
+      !this.reflector.getAllAndOverride<boolean>(
+        ALLOW_PENDING_PASSWORD_CHANGE_KEY,
+        targets,
+      )
+    ) {
+      throw new ForbiddenException(
+        'Change your temporary password (POST /me/password) before continuing',
+      );
     }
 
     const requiredRoles =

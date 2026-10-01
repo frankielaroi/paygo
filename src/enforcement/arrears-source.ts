@@ -4,6 +4,11 @@ export type ArrearsDetail = Record<string, string | number | boolean | null>;
 export interface OverdueBike {
   bikeId: string;
   detail: ArrearsDetail;
+  /**
+   * Whether the rider has been warned long enough for an automatic lock. An overdue bike that
+   * is not lockable is neither locked nor restored by the sweep: it waits for the warning.
+   */
+  lockable: boolean;
 }
 
 /**

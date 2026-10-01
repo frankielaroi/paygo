@@ -23,6 +23,14 @@ export class BikeStatusDto {
   @ApiProperty()
   online!: boolean;
 
+  @ApiProperty({
+    nullable: true,
+    description:
+      'Estimated from pack voltage between BIKE_BATTERY_EMPTY_MV and BIKE_BATTERY_FULL_MV. ' +
+      'A guide, not a fuel gauge. Null without a voltage reading.',
+  })
+  batteryPercent!: number | null;
+
   @ApiProperty({ type: BikePositionDataDto, nullable: true })
   current!: BikePositionDataDto | null;
 }

@@ -14,7 +14,9 @@ import {
   CustomerStatus,
   StaffRole,
 } from '../generated/prisma/enums';
+import { LoanArrearsService } from '../loans/loan-arrears.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { riderStandingOf } from './rider-standing';
 import { Permission, roleHasPermission } from '../users/enums/role.enum';
 import {
   type CreateCustomerDto,
@@ -74,7 +76,10 @@ const KYC_FIELDS = [
  */
 @Injectable()
 export class CustomersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly arrears: LoanArrearsService,
+  ) {}
 
   async create(
     input: CreateCustomerDto,
@@ -124,30 +129,47 @@ export class CustomersService {
         OR: [
           { firstName: { contains: word, mode: 'insensitive' } },
           { lastName: { contains: word, mode: 'insensitive' } },
-          { phone: { contains: normalizePhone(word) } },
+          ...phoneSearchForms(word).map((form) => ({
+            phone: { contains: form },
+          })),
           { nationalId: { contains: word, mode: 'insensitive' } },
         ],
       })),
     };
 
-    const [rows, total] = await Promise.all([
+    // Standing is derived per rider from arrears, so every rider matching the search is
+    // loaded and the standing filter and paging apply in memory. Fine for a few thousand
+    // riders; beyond that, persist the standing and filter in the database.
+    const [rows, overdue] = await Promise.all([
       this.prisma.customer.findMany({
         where,
         select: summarySelect,
         orderBy: {
           [query.sortBy ?? 'createdAt']: query.sortOrder ?? 'desc',
         },
-        skip: query.skip,
-        take: query.limit,
       }),
-      this.prisma.customer.count({ where }),
+      this.overdueByBike(),
     ]);
+    const riders = rows.map((row) => toSummary(row, overdue));
+    const matching = riders.filter(
+      (rider) => !query.standing || rider.standing === query.standing,
+    );
 
-    return new PaginatedResponseDto(
-      rows.map(toSummary),
-      total,
-      query.page,
-      query.limit,
+    return Object.assign(
+      new PaginatedResponseDto(
+        matching.slice(query.skip, query.skip + query.limit),
+        matching.length,
+        query.page,
+        query.limit,
+      ),
+      {
+        counts: {
+          all: riders.length,
+          active: riders.filter((r) => r.standing === 'active').length,
+          overdue: riders.filter((r) => r.standing === 'overdue').length,
+          noBike: riders.filter((r) => r.standing === 'no-bike').length,
+        },
+      },
     );
   }
 
@@ -199,7 +221,7 @@ export class CustomersService {
 
     const { contacts, ...rest } = customer;
     return {
-      ...toSummary(rest),
+      ...toSummary(rest, await this.overdueByBike()),
       alternatePhone: rest.alternatePhone,
       dateOfBirth: rest.dateOfBirth,
       photoUrl: rest.photoUrl,
@@ -420,6 +442,14 @@ export class CustomersService {
         )
       : error;
   }
+
+  /** Owed past grace per bike, from the arrears source the dashboard and enforcement use. */
+  private async overdueByBike(): Promise<Map<string, number>> {
+    const overdue = await this.arrears.findOverdue(new Date());
+    return new Map(
+      overdue.map((row) => [row.bikeId, Number(row.detail.overdueMinor)]),
+    );
+  }
 }
 
 function searchWords(search: string | undefined): string[] {
@@ -440,7 +470,10 @@ function bikeRef(bike: {
   };
 }
 
-function toSummary(customer: SummaryRow): CustomerSummaryDto {
+function toSummary(
+  customer: SummaryRow,
+  overdueByBike: ReadonlyMap<string, number>,
+): CustomerSummaryDto {
   return {
     id: customer.id,
     status: customer.status,
@@ -454,5 +487,21 @@ function toSummary(customer: SummaryRow): CustomerSummaryDto {
     kycVerifiedAt: customer.kycVerifiedAt,
     currentBikes: customer.bikeAssignments.map((row) => bikeRef(row.bike)),
     createdAt: customer.createdAt,
+    standing: riderStandingOf(
+      customer.bikeAssignments.map((row) => row.bike.id),
+      overdueByBike,
+    ),
   };
+}
+
+/**
+ * What to look for in stored phones for a search word. Phones are stored as entered, often
+ * internationally (+233241234567), while staff type the local form (0241234): a local
+ * fragment starting with 0 also matches its 233 form, so "0241 234" finds +233241234567.
+ */
+export function phoneSearchForms(word: string): string[] {
+  const compact = normalizePhone(word);
+  return /^0\d{2,}$/.test(compact)
+    ? [compact, `233${compact.slice(1)}`]
+    : [compact];
 }

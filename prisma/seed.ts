@@ -54,7 +54,9 @@ async function main(): Promise<void> {
     });
 
     console.log(`Created admin ${user.email} (${user.id}).`);
-    console.log('Change this password before anyone else uses the environment.');
+    console.log(
+      'Change this password before anyone else uses the environment.',
+    );
   } finally {
     await prisma.$disconnect();
   }

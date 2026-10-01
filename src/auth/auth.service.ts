@@ -1,7 +1,13 @@
-import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
+import { phoneLookupForms } from '../common/phone';
 import type { Env } from '../config/env.validation';
 import type { LoginResponseDto } from './dto/login-response.dto';
 import type { RefreshResponseDto } from './dto/refresh-response.dto';
@@ -36,8 +42,14 @@ export class AuthService {
     dto: LoginDto,
     context: RefreshTokenContext = {},
   ): Promise<LoginResponseDto> {
-    const email = dto.email.toLowerCase();
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    if ((dto.email === undefined) === (dto.phone === undefined)) {
+      throw new BadRequestException('Send either email or phone');
+    }
+    const login = dto.email?.toLowerCase() ?? dto.phone ?? '';
+    const user =
+      dto.phone === undefined
+        ? await this.prisma.user.findUnique({ where: { email: login } })
+        : await this.findUserByPhone(login);
 
     // One generic failure for every reason a login can fail, so the endpoint cannot be used
     // to enumerate staff or to discover that an account is locked.
@@ -60,7 +72,7 @@ export class AuthService {
         await this.recordFailedAttempt(user.id, user.failedLoginAttempts);
       }
 
-      this.logger.warn(`Failed login for ${email}`);
+      this.logger.warn(`Failed login for ${login}`);
       throw invalid;
     }
 
@@ -91,8 +103,28 @@ export class AuthService {
         firstName: user.firstName,
         lastName: user.lastName,
         role: user.role,
+        mustChangePassword: user.mustChangePassword,
       },
     };
+  }
+
+  /**
+   * Phones are stored as entered, so one number can sit in several forms. If two accounts
+   * hold the same number, neither may sign in by phone: guessing between them would let one
+   * person's password open the other's account.
+   */
+  private async findUserByPhone(phone: string) {
+    const matches = await this.prisma.user.findMany({
+      where: { phone: { in: phoneLookupForms(phone) } },
+      take: 2,
+    });
+    if (matches.length > 1) {
+      this.logger.warn(
+        `Phone login for ${phone} matches more than one account; refused`,
+      );
+      return null;
+    }
+    return matches[0] ?? null;
   }
 
   /**

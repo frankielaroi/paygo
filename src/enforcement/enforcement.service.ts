@@ -7,7 +7,7 @@ import {
   OnModuleDestroy,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OnEvent } from '@nestjs/event-emitter';
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
 import type { Subscription } from 'rxjs';
 import type { Env } from '../config/env.validation';
 import {
@@ -20,7 +20,9 @@ import type {
   EnforcementEvent,
   Prisma,
 } from '../generated/prisma/client';
+import type { AuthenticatedStaff } from '../common/types/authenticated-staff';
 import { PrismaService } from '../prisma/prisma.service';
+import { Permission, roleHasPermission } from '../users/enums/role.enum';
 import {
   commandFromResponse,
   type DeviceCommand,
@@ -41,6 +43,12 @@ import {
   type ArrearsDetail,
   type ArrearsSource,
 } from './arrears-source';
+import {
+  ENFORCEMENT_REVIEW_FLAGGED,
+  ENFORCEMENT_STATE_CONFIRMED,
+  type EnforcementReviewFlaggedEvent,
+  type EnforcementStateConfirmedEvent,
+} from './enforcement.events';
 import {
   checkLatest,
   checkSustained,
@@ -63,7 +71,11 @@ export type ReconcileTrigger =
 
 export interface EnforcementView {
   state: BikeEnforcement | null;
-  events: EnforcementEvent[];
+  events: Array<
+    EnforcementEvent & {
+      actor: { firstName: string; lastName: string; isActive: boolean } | null;
+    }
+  >;
 }
 
 type BlockReason = string;
@@ -109,6 +121,7 @@ export class EnforcementService
     private readonly tracking: TrackingService,
     private readonly devices: TcpServerService,
     @Inject(ARREARS_SOURCE) private readonly arrears: ArrearsSource,
+    private readonly events: EventEmitter2,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -146,19 +159,19 @@ export class EnforcementService
   async setDesiredStateByStaff(
     bikeId: string,
     state: MobilityState,
-    userId: string,
+    actor: AuthenticatedStaff,
     reason: string,
   ): Promise<EnforcementView> {
-    await this.requireBike(bikeId);
+    await this.requireBikeFor(bikeId, actor);
     await this.writeDesiredState(
       bikeId,
       state,
-      { kind: 'staff', userId },
+      { kind: 'staff', userId: actor.id },
       reason,
       null,
     );
     await this.reconcile(bikeId, 'staff');
-    return this.getEnforcement(bikeId);
+    return this.getEnforcement(bikeId, actor);
   }
 
   /**
@@ -203,6 +216,12 @@ export class EnforcementService
       const overdueIds = new Set(overdue.map((finding) => finding.bikeId));
 
       for (const finding of overdue) {
+        // Overdue but not yet lockable (the rider has not been warned long enough): neither
+        // lock nor restore. Keeping it in overdueIds is what stops the restore pass below from
+        // unlocking a bike that is still behind.
+        if (!finding.lockable) {
+          continue;
+        }
         await this.applyArrears(
           finding.bikeId,
           true,
@@ -296,14 +315,23 @@ export class EnforcementService
     await this.reconcile(bike.id, 'command-response');
   }
 
-  async getEnforcement(bikeId: string): Promise<EnforcementView> {
-    await this.requireBike(bikeId);
+  async getEnforcement(
+    bikeId: string,
+    actor: AuthenticatedStaff,
+  ): Promise<EnforcementView> {
+    await this.requireBikeFor(bikeId, actor);
     const [state, events] = await Promise.all([
       this.prisma.bikeEnforcement.findUnique({ where: { bikeId } }),
       this.prisma.enforcementEvent.findMany({
         where: { bikeId },
         orderBy: { createdAt: 'desc' },
         take: 50,
+        // The actor's name, active or not: a deactivated account still owns what it did.
+        include: {
+          actor: {
+            select: { firstName: true, lastName: true, isActive: true },
+          },
+        },
       }),
     ]);
     return { state, events };
@@ -604,7 +632,7 @@ export class EnforcementService
     }
 
     const now = new Date();
-    await this.prisma.$transaction(async (tx) => {
+    const reviewEventId = await this.prisma.$transaction(async (tx) => {
       await tx.bikeEnforcement.update({
         where: { bikeId: row.bikeId },
         data: {
@@ -627,20 +655,41 @@ export class EnforcementService
         });
       }
 
-      if (flagReview) {
-        await tx.enforcementEvent.create({
-          data: {
-            bikeId: row.bikeId,
-            type: EnforcementEventType.REVIEW_FLAGGED,
-            trigger,
-            fromState: row.confirmedState,
-            toState: row.desiredState,
-            reason: `Immobilize wanted but telemetry cannot be trusted: ${reason}`,
-            telemetry: telemetry ? snapshotJson(telemetry) : undefined,
-          },
-        });
+      if (!flagReview) {
+        return null;
       }
+      const flagged = await tx.enforcementEvent.create({
+        data: {
+          bikeId: row.bikeId,
+          type: EnforcementEventType.REVIEW_FLAGGED,
+          trigger,
+          fromState: row.confirmedState,
+          toState: row.desiredState,
+          reason: `Immobilize wanted but telemetry cannot be trusted: ${reason}`,
+          telemetry: telemetry ? snapshotJson(telemetry) : undefined,
+        },
+        select: { id: true },
+      });
+      return flagged.id;
     });
+
+    if (reviewEventId) {
+      this.announce<EnforcementReviewFlaggedEvent>(ENFORCEMENT_REVIEW_FLAGGED, {
+        bikeId: row.bikeId,
+        enforcementEventId: reviewEventId,
+        reason,
+        flaggedAt: now,
+      });
+    }
+  }
+
+  /** Emits after commit. A listener's failure must never undo or interrupt enforcement. */
+  private announce<T>(name: string, payload: T): void {
+    try {
+      this.events.emit(name, payload);
+    } catch (error) {
+      this.logger.error(`Listener for ${name} failed: ${describe(error)}`);
+    }
   }
 
   private async recordResponse(
@@ -673,7 +722,7 @@ export class EnforcementService
     }
 
     const state = STATE_FOR_COMMAND[command];
-    await this.prisma.$transaction(async (tx) => {
+    const confirmed = await this.prisma.$transaction(async (tx) => {
       await tx.bikeEnforcement.update({
         where: { bikeId },
         data: {
@@ -684,7 +733,7 @@ export class EnforcementService
             : {}),
         },
       });
-      await tx.enforcementEvent.create({
+      return tx.enforcementEvent.create({
         data: {
           bikeId,
           type: EnforcementEventType.STATE_CONFIRMED,
@@ -694,8 +743,24 @@ export class EnforcementService
           reason: 'Device reported its output state',
           deviceResponse: event.text,
         },
+        select: { id: true },
       });
     });
+
+    // Only a real change is news to anyone; a repeated reply confirming the same state is not.
+    if (row.confirmedState !== state) {
+      this.announce<EnforcementStateConfirmedEvent>(
+        ENFORCEMENT_STATE_CONFIRMED,
+        {
+          bikeId,
+          enforcementEventId: confirmed.id,
+          fromState: row.confirmedState,
+          toState: state,
+          desiredSource: row.desiredSource,
+          confirmedAt: event.receivedAt,
+        },
+      );
+    }
   }
 
   private serialize(bikeId: string, task: () => Promise<void>): Promise<void> {
@@ -737,12 +802,34 @@ export class EnforcementService
     }
   }
 
-  private async requireBike(bikeId: string): Promise<void> {
+  /**
+   * A bike the caller may see and act on. With ASSET_IMMOBILIZE_ANY, any bike; otherwise (field
+   * agents) only a bike whose current rider is assigned to them. Anything else is a 404, so the
+   * endpoint does not confirm a bike exists to someone who may not touch it.
+   */
+  private async requireBikeFor(
+    bikeId: string,
+    actor: AuthenticatedStaff,
+  ): Promise<void> {
     const bike = await this.prisma.bike.findUnique({
       where: { id: bikeId },
       select: { id: true },
     });
     if (!bike) {
+      throw new NotFoundException('Bike not found');
+    }
+    if (roleHasPermission(actor.role, Permission.ASSET_IMMOBILIZE_ANY)) {
+      return;
+    }
+    const held = await this.prisma.bikeAssignment.findFirst({
+      where: {
+        bikeId,
+        endedAt: null,
+        customer: { assignedAgentId: actor.id },
+      },
+      select: { id: true },
+    });
+    if (!held) {
       throw new NotFoundException('Bike not found');
     }
   }

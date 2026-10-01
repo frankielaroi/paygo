@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
-import { ThrottlerGuard, ThrottlerModule, seconds } from '@nestjs/throttler';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
@@ -16,7 +16,11 @@ import { AssetsModule } from './assets/assets.module';
 import { CustomersModule } from './customers/customers.module';
 import { LoansModule } from './loans/loans.module';
 import { PaymentsModule } from './payments/payments.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { UsersModule } from './users/users.module';
+import { DashboardModule } from './dashboard/dashboard.module';
 import { type Env, validateEnv } from './config/env.validation';
+import { throttlerOptions } from './config/throttler';
 
 @Module({
   imports: [
@@ -28,20 +32,13 @@ import { type Env, validateEnv } from './config/env.validation';
     }),
     ThrottlerModule.forRootAsync({
       inject: [ConfigService],
-      useFactory: (config: ConfigService<Env, true>) => ({
-        throttlers: [
-          // Ordinary traffic.
-          { name: 'default', ttl: seconds(60), limit: 120 },
-          // Credential endpoints, drawn from their own bucket via @Throttle({ login: {} }).
-          {
-            name: 'login',
-            ttl: seconds(
-              config.get('LOGIN_RATE_WINDOW_SECONDS', { infer: true }),
-            ),
-            limit: config.get('LOGIN_RATE_LIMIT', { infer: true }),
-          },
-        ],
-      }),
+      useFactory: (config: ConfigService<Env, true>) =>
+        throttlerOptions({
+          loginLimit: config.get('LOGIN_RATE_LIMIT', { infer: true }),
+          loginWindowSeconds: config.get('LOGIN_RATE_WINDOW_SECONDS', {
+            infer: true,
+          }),
+        }),
     }),
     EventEmitterModule.forRoot(),
     PrismaModule,
@@ -53,6 +50,9 @@ import { type Env, validateEnv } from './config/env.validation';
     CustomersModule,
     LoansModule,
     PaymentsModule,
+    NotificationsModule,
+    UsersModule,
+    DashboardModule,
   ],
   controllers: [AppController],
   providers: [

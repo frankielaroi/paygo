@@ -80,12 +80,46 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
   UNALLOCATED and held in the ledger until staff allocate it. Manual payments
   (`POST /loans/:id/payments`) are refused outright instead. Processing is inline for now;
   when BullMQ lands the webhook should enqueue.
+- Staff (`src/users/`): `/staff` for admins (create with a one-time temporary password,
+  edit, role change, deactivate and reactivate, password reset, and `/staff/:id/activity`,
+  read live from every module's audit trail) and `/me` for everyone (profile, password
+  change). Three roles: ADMIN, FIELD_AGENT, FINANCE. An account holding a temporary password
+  reaches only routes marked `@AllowPendingPasswordChange()` (enforced in `RolesGuard`, on
+  every route, before role checks). Deactivation stops sign-in at once and revokes every
+  session; nobody is deleted. There is always an active admin: nobody can demote or
+  deactivate the last one (checked under a row lock), deactivate themselves, or change their
+  own role. Every account change goes to the append-only `staff_audit_events`.
+- Dashboard (`src/dashboard/`, routes under `/dashboard`): the FleetView screens' read side.
+  `GET /dashboard` (KPIs, status counts, overdue queue, recent activity), `GET /dashboard/fleet`
+  (bikes on the road, filter and search), and `POST /dashboard/overdue/:loanId/reminder` (one
+  staff-sent SMS per loan per day). Each bike gets exactly one status, by precedence:
+  immobilized (device-confirmed), offline, overdue, active (`fleet-status.ts`). Overdue comes
+  from `LoanArrearsService`, so the dashboard and the sweep always agree. Lock and unlock stay on
+  the enforcement endpoint; rows only say `canLock` / `canUnlock` for the viewer. Field agents
+  see their own riders only; finance sees everything but gets no lock actions. It owns no data
+  and caches nothing; the fleet is filtered in memory, fine at hundreds of bikes, to revisit at
+  many thousands.
+- Notifications (`src/notifications/`): rider SMS through a `MessageChannel` abstraction
+  (Arkesel today; the log channel in development; in production without a key, a channel
+  that sends nothing), payment reminders and pre-lockout warnings from a scheduler, lock and
+  unlock messages from enforcement's events, staff alerts (`/staff-alerts`), and delivery
+  reports at `/webhooks/arkesel/:token` (Arkesel does not sign callbacks, so the path carries
+  a secret). Every message is recorded before it is sent and is unique on a `dedupeKey` naming
+  the event, so a repeated event never messages twice.
+  **The warning gate:** the arrears sweep only locks a bike whose rider was warned about a
+  still-unpaid installment at least `LOCKOUT_WARNING_LEAD_HOURS` ago (`OverdueBike.lockable`,
+  computed in the arrears SQL). An overdue bike that is not lockable is neither locked nor
+  restored. A send refused for the rider's number (`rejected`) counts as warned, so a bad number
+  cannot dodge enforcement, and staff are alerted. A provider outage or bad credentials
+  (`unavailable`) never counts: the warning stays pending and the lock waits. Keep that
+  distinction in any new channel.
+  Enforcement announces `enforcement.state-confirmed` and `enforcement.review-flagged`
+  (`enforcement.events.ts`) after commit and knows nothing of who listens.
 
 **Not built yet:** plans, initiating Paystack charges (the webhook expects `metadata.loan_id`),
 write-offs and reversals, refunds of rider credit, Redis/BullMQ,
-customer (rider) authentication, revoking sessions on password change
-(`RefreshTokenService.revokeAllForUser` exists but nothing calls it), and a job to delete
-expired refresh token rows.
+customer (rider) authentication, reassigning a deactivated agent's riders, and a job to
+delete expired refresh token rows.
 
 `src/tracking/` subscribes to `device.positions`. The protocol layer remains unaware of bike
 records and persistence; tracking resolves each IMEI, stores readable telemetry, and never
@@ -218,6 +252,11 @@ catch it.
 - `db:seed` runs under **tsx**, not ts-node. ts-node cannot resolve the generated client's
   `.js` specifiers at runtime.
 - The auth e2e spec needs the seeded admin and the `SEED_ADMIN_*` values from `.env`.
+- `test:e2e` runs `--runInBand`. The suites share one database and the seeded admin, and the
+  enforcement sweep and notification scheduler act on the whole fleet, so parallel suites
+  change each other's riders mid-test. An e2e test must never act destructively on the seeded
+  admin (deactivate, demote, reset its password): if the guard it tests regresses, it locks
+  everyone out. Use a throwaway account created in the test.
 
 ### Docker
 
@@ -557,12 +596,18 @@ concurrent-device count before trusting it at fleet scale.
   still runs an argon2 verification against a dummy hash so the response time does not
   differ. Tests assert both properties; keep them passing.
 - RBAC: staff roles enumerated in `src/users/enums/role.enum.ts`, applied with `@Roles(...)`
-  and enforced by `RolesGuard`. The staff roles are **admin** and **field agent**. Customers
-  are a separate model and are **not** a role in this enum, see *Database* above.
+  and enforced by `RolesGuard`. The staff roles are **admin**, **field agent** and
+  **finance** (collections). Customers are a separate model and are **not** a role in this
+  enum, see *Database* above. Permissions come from the role alone, so two people with the
+  same role always have the same access.
 - Role boundaries that matter: a field agent must not read or move money belonging to another
-  agent's customers, and **immobilize/restore is not a field-agent capability by default**,
-  an agent in the field is the most likely person to want that button and the least able to
-  verify the bike is stopped. Grant it deliberately or not at all.
+  agent's customers. **Immobilize/restore was granted to field agents deliberately**, but only
+  for bikes held by their own riders (`ASSET_IMMOBILIZE`, scoped in `EnforcementService`;
+  `ASSET_IMMOBILIZE_ANY` is admin only). An agent in the field is the most likely person to
+  want that button and the least able to verify the bike is stopped, so their locks pass the
+  same stationary interlock as anyone's, and every use shows in their activity log. Finance
+  reads riders, bikes and loans and records and allocates payments; it cannot lend, lock, edit
+  riders or manage staff.
 - If a rider-facing API ships, it authenticates `Customer` (phone/OTP) on its own path and
   issues tokens that the staff guards do not accept. A customer sees only their own contract,
   payments and bike.
@@ -607,8 +652,8 @@ revocable. `RefreshTokenService` owns them.
   only one may win, and the loser is treated as a reuse rather than handed a second session.
 - Confirmed state comes from the database. `revoke` is idempotent, so a client can always
   complete a logout.
-- `revokeAllForUser` exists for password changes and suspected compromise. Wire it into the
-  password change flow when that ships.
+- `revokeAllForUser` ends every session on a password change (`POST /me/password`), an admin
+  password reset, and a deactivation.
 
 ### Login protection: two independent layers
 
@@ -711,6 +756,14 @@ Expected variables:
 | `ENFORCEMENT_COMMAND_RETRY_SECONDS` | Wait for a device reply before resending a command (default 300) |
 | `ENFORCEMENT_SWEEP_INTERVAL_SECONDS` | Arrears sweep and retry interval (default 900) |
 | `PAYSTACK_SECRET_KEY` | Verifies Paystack webhook signatures; without it the webhook refuses every request |
+| `ARKESEL_API_KEY` | Rider SMS. Unset: log only in development, nothing sent in production (so no automatic locks) |
+| `ARKESEL_SENDER_ID` / `ARKESEL_SANDBOX` | Registered sender name (default `PayGo`); sandbox sends are not delivered |
+| `ARKESEL_CALLBACK_BASE_URL` / `ARKESEL_CALLBACK_TOKEN` | Public URL and secret path token for delivery reports |
+| `NOTIFICATIONS_ENABLED` / `NOTIFICATIONS_INTERVAL_SECONDS` | The reminder, warning and retry scheduler (default on, every 300s; off in e2e) |
+| `PAYMENT_REMINDER_LEAD_DAYS` | Days before a due date to remind; 0 disables (default 1, so daily loans get a daily reminder) |
+| `LOCKOUT_WARNING_LEAD_HOURS` | How long before an automatic lock the rider must have been warned (default 12) |
+| `RIDER_MESSAGE_START_HOUR` / `RIDER_MESSAGE_END_HOUR` | UTC hours for reminders and warnings (default 7 to 20); lock and unlock messages go any time |
+| `NOTIFICATION_MAX_ATTEMPTS` | Failed sends before staff are alerted that a message is stuck (default 3); retries continue |
 
 There is deliberately no restore threshold variable: the catch-up rule is "nothing past grace
 owed", with no tolerance. Changing that is a business decision, and belongs in `overdueMinor`

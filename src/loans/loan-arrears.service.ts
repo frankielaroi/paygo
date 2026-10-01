@@ -1,4 +1,6 @@
 import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import type { Env } from '../config/env.validation';
 import type { ArrearsSource, OverdueBike } from '../enforcement/arrears-source';
 import type { Prisma } from '../generated/prisma/client';
 import { LedgerService } from '../ledger/ledger.service';
@@ -18,6 +20,7 @@ interface OverdueRow {
   bikeId: string;
   currency: string;
   overdue: bigint | number | string;
+  lockable: boolean;
 }
 
 /**
@@ -33,6 +36,7 @@ export class LoanArrearsService implements ArrearsSource {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ledger: LedgerService,
+    private readonly config: ConfigService<Env, true>,
   ) {}
 
   /**
@@ -41,9 +45,29 @@ export class LoanArrearsService implements ArrearsSource {
    */
   async findOverdue(asOf: Date): Promise<OverdueBike[]> {
     const today = isoDay(asOf);
+    const warnedBy = isoTimestamp(
+      new Date(
+        asOf.getTime() -
+          this.config.get('LOCKOUT_WARNING_LEAD_HOURS', { infer: true }) *
+            3_600_000,
+      ),
+    );
+    // lockable: the rider was warned about an installment that is still unpaid, and the
+    // warning went out (or failed for a reason specific to the rider, such as an invalid
+    // number) at least the lead time ago. A warning still pending, for instance during a
+    // provider outage, does not count: no warning attempt, no automatic lock.
     const rows = await this.prisma.$queryRaw<OverdueRow[]>`
       SELECT l."id" AS "loanId", l."bikeId" AS "bikeId", l."currency" AS "currency",
-             due."amount" - COALESCE(paid."amount", 0) AS "overdue"
+             due."amount" - COALESCE(paid."amount", 0) AS "overdue",
+             EXISTS (
+               SELECT 1
+               FROM "notifications" n
+               JOIN "loan_installments" wi ON wi."id" = n."installmentId"
+               WHERE n."loanId" = l."id"
+                 AND n."kind" = 'LOCKOUT_WARNING'
+                 AND wi."paidMinor" < wi."amountMinor"
+                 AND COALESCE(n."sentAt", n."failedAt") <= ${warnedBy}::timestamp
+             ) AS "lockable"
       FROM "loans" l
       JOIN (
         SELECT i."loanId", SUM(i."amountMinor") AS "amount"
@@ -64,11 +88,13 @@ export class LoanArrearsService implements ArrearsSource {
 
     return rows.map((row) => ({
       bikeId: row.bikeId,
+      lockable: row.lockable,
       detail: {
         loanId: row.loanId,
         overdueMinor: Number(row.overdue),
         currency: row.currency,
         asOf: today,
+        warned: row.lockable,
       },
     }));
   }
@@ -104,4 +130,12 @@ export class LoanArrearsService implements ArrearsSource {
 /** YYYY-MM-DD of the UTC day, passed as text so the database session time zone cannot shift it. */
 function isoDay(date: Date): string {
   return utcDay(date).toISOString().slice(0, 10);
+}
+
+/**
+ * A UTC timestamp without the zone suffix, compared against Prisma's timestamp(3) columns,
+ * which hold UTC. Passed as text for the same reason as isoDay.
+ */
+function isoTimestamp(date: Date): string {
+  return date.toISOString().replace('Z', '');
 }

@@ -4,8 +4,16 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PaginatedResponseDto } from '../common/dto/paginated-response.dto';
 import { isUniqueViolation } from '../common/prisma-errors';
+import type { AuthenticatedStaff } from '../common/types/authenticated-staff';
+import type { Env } from '../config/env.validation';
+import {
+  type FleetStatus,
+  fleetStatusOf,
+  mobilityControlsOf,
+} from '../dashboard/fleet-status';
 import { EnforcementService } from '../enforcement/enforcement.service';
 import type { Prisma } from '../generated/prisma/client';
 import {
@@ -13,8 +21,12 @@ import {
   BikeStatus,
   CustomerStatus,
   LoanStatus,
+  MobilityState,
 } from '../generated/prisma/enums';
+import { LoanArrearsService } from '../loans/loan-arrears.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { batteryPercentOf, odometerKmOf } from '../tracking/telemetry';
+import { Permission, roleHasPermission } from '../users/enums/role.enum';
 import type {
   AssignBikeDto,
   CreateBikeDto,
@@ -26,7 +38,9 @@ import type {
 } from './dto/bike-input.dto';
 import type { BikeQueryDto } from './dto/bike-query.dto';
 import type {
+  BikeCountsDto,
   BikeDetailDto,
+  BikeLiveDto,
   BikePageDto,
   BikeSummaryDto,
 } from './dto/bike-response.dto';
@@ -51,6 +65,18 @@ const summarySelect = {
   imei: true,
   retiredAt: true,
   createdAt: true,
+  lastReportedAt: true,
+  currentPosition: {
+    select: {
+      recordedAt: true,
+      latitude: true,
+      longitude: true,
+      speed: true,
+      hasFix: true,
+      externalVoltageMv: true,
+      odometerMeters: true,
+    },
+  },
   enforcement: { select: { desiredState: true, confirmedState: true } },
   assignments: {
     where: { endedAt: null },
@@ -87,6 +113,8 @@ export class BikesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly enforcement: EnforcementService,
+    private readonly arrears: LoanArrearsService,
+    private readonly config: ConfigService<Env, true>,
   ) {}
 
   async create(input: CreateBikeDto, userId: string): Promise<BikeDetailDto> {
@@ -169,14 +197,25 @@ export class BikesService {
     return this.get(id);
   }
 
-  async list(query: BikeQueryDto): Promise<BikePageDto> {
+  /**
+   * Bikes matching the search, each with its live status, plus counts per status. Live status
+   * is derived per bike (tracking, enforcement and arrears), so every bike matching the search
+   * is loaded and the status filters and paging apply in memory, as on the dashboard. Fine for
+   * fleets of a few thousand; beyond that, persist the status and filter in the database.
+   */
+  async list(
+    query: BikeQueryDto,
+    viewer?: AuthenticatedStaff,
+  ): Promise<BikePageDto> {
+    const now = new Date();
     const where: Prisma.BikeWhereInput = {
-      ...(query.status ? { status: query.status } : {}),
       AND: searchWords(query.search).map((word) => ({
         OR: [
           { registrationNumber: { contains: word, mode: 'insensitive' } },
           { vin: { contains: word, mode: 'insensitive' } },
           { label: { contains: word, mode: 'insensitive' } },
+          { make: { contains: word, mode: 'insensitive' } },
+          { model: { contains: word, mode: 'insensitive' } },
           { imei: { contains: word } },
           {
             assignments: {
@@ -196,28 +235,40 @@ export class BikesService {
       })),
     };
 
-    const [rows, total] = await Promise.all([
+    const [rows, overdue] = await Promise.all([
       this.prisma.bike.findMany({
         where,
         select: summarySelect,
         orderBy: {
           [query.sortBy ?? 'createdAt']: query.sortOrder ?? 'desc',
         },
-        skip: query.skip,
-        take: query.limit,
       }),
-      this.prisma.bike.count({ where }),
+      this.overdueByBike(now),
     ]);
+    const canImmobilize = this.canImmobilize(viewer);
+    const bikes = rows.map((row) => ({
+      row,
+      live: this.liveOf(row, overdue.get(row.id) ?? 0, canImmobilize, now),
+    }));
 
-    return new PaginatedResponseDto(
-      rows.map(toSummary),
-      total,
-      query.page,
-      query.limit,
+    const matching = bikes
+      .filter(({ row }) => !query.status || row.status === query.status)
+      .filter(
+        ({ live }) =>
+          !query.liveStatus || live.fleetStatus === query.liveStatus,
+      );
+    const page = matching
+      .slice(query.skip, query.skip + query.limit)
+      .map(({ row, live }) => toSummary(row, live));
+
+    return Object.assign(
+      new PaginatedResponseDto(page, matching.length, query.page, query.limit),
+      { counts: countsOf(bikes) },
     );
   }
 
-  async get(id: string): Promise<BikeDetailDto> {
+  /** A bike and its histories, with the lock controls `viewer` may use (none without one). */
+  async get(id: string, viewer?: AuthenticatedStaff): Promise<BikeDetailDto> {
     const bike = await this.prisma.bike.findUnique({
       where: { id },
       select: {
@@ -272,7 +323,15 @@ export class BikesService {
     });
 
     return {
-      ...toSummary(bike),
+      ...toSummary(
+        bike,
+        this.liveOf(
+          bike,
+          (await this.overdueByBike(new Date())).get(bike.id) ?? 0,
+          this.canImmobilize(viewer),
+          new Date(),
+        ),
+      ),
       purchasePriceMinor: bike.purchasePriceMinor,
       purchaseCurrency: bike.purchaseCurrency,
       purchasedAt: bike.purchasedAt,
@@ -756,6 +815,81 @@ export class BikesService {
         )
       : error;
   }
+
+  /** Owed past grace per bike, in minor units, from the arrears source enforcement uses. */
+  private async overdueByBike(now: Date): Promise<Map<string, number>> {
+    const overdue = await this.arrears.findOverdue(now);
+    return new Map(
+      overdue.map((row) => [row.bikeId, Number(row.detail.overdueMinor)]),
+    );
+  }
+
+  private canImmobilize(viewer: AuthenticatedStaff | undefined): boolean {
+    return (
+      viewer !== undefined &&
+      roleHasPermission(viewer.role, Permission.ASSET_IMMOBILIZE)
+    );
+  }
+
+  private liveOf(
+    bike: SummaryRow,
+    overdueMinor: number,
+    canImmobilize: boolean,
+    now: Date,
+  ): BikeLiveDto {
+    const offlineAfterMs =
+      this.config.get('TRACKING_OFFLINE_AFTER_SECONDS', { infer: true }) * 1000;
+    const online =
+      bike.imei !== null &&
+      bike.lastReportedAt !== null &&
+      now.getTime() - bike.lastReportedAt.getTime() <= offlineAfterMs;
+    const confirmed = bike.enforcement?.confirmedState ?? null;
+    const desired = bike.enforcement?.desiredState ?? MobilityState.MOBILE;
+    const position = bike.currentPosition;
+    const fixed = position?.hasFix ? position : null;
+
+    return {
+      fleetStatus:
+        bike.status === BikeStatus.ASSIGNED
+          ? fleetStatusOf({ confirmedState: confirmed, online, overdueMinor })
+          : null,
+      online,
+      lastReportedAt: bike.lastReportedAt,
+      speedKmh: online ? (position?.speed ?? null) : null,
+      batteryPercent: batteryPercentOf(
+        position?.externalVoltageMv,
+        this.config.get('BIKE_BATTERY_EMPTY_MV', { infer: true }),
+        this.config.get('BIKE_BATTERY_FULL_MV', { infer: true }),
+      ),
+      odometerKm: odometerKmOf(position?.odometerMeters),
+      latitude: fixed?.latitude ?? null,
+      longitude: fixed?.longitude ?? null,
+      positionAt: fixed?.recordedAt ?? null,
+      ...mobilityControlsOf({
+        canImmobilize,
+        online,
+        desiredState: desired,
+        confirmedState: confirmed,
+      }),
+    };
+  }
+}
+
+function countsOf(
+  bikes: Array<{ row: SummaryRow; live: BikeLiveDto }>,
+): BikeCountsDto {
+  const byStatus = (status: FleetStatus): number =>
+    bikes.filter(({ live }) => live.fleetStatus === status).length;
+  return {
+    all: bikes.length,
+    active: byStatus('active'),
+    overdue: byStatus('overdue'),
+    immobilized: byStatus('immobilized'),
+    offline: byStatus('offline'),
+    inInventory: bikes.filter(
+      ({ row }) => row.status === BikeStatus.IN_INVENTORY,
+    ).length,
+  };
 }
 
 function searchWords(search: string | undefined): string[] {
@@ -776,7 +910,7 @@ function riderRef(customer: {
   };
 }
 
-function toSummary(bike: SummaryRow): BikeSummaryDto {
+function toSummary(bike: SummaryRow, live: BikeLiveDto): BikeSummaryDto {
   const open = bike.assignments[0];
   return {
     id: bike.id,
@@ -804,6 +938,7 @@ function toSummary(bike: SummaryRow): BikeSummaryDto {
       : null,
     retiredAt: bike.retiredAt,
     createdAt: bike.createdAt,
+    live,
   };
 }
 

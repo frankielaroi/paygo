@@ -62,8 +62,11 @@ export class BikesController {
     summary: 'Search bikes by plate, VIN, label, IMEI or current rider',
   })
   @ApiOkResponse({ type: BikePageDto })
-  list(@Query() query: BikeQueryDto): Promise<BikePageDto> {
-    return this.bikes.list(query);
+  list(
+    @Query() query: BikeQueryDto,
+    @CurrentUser() user: AuthenticatedStaff,
+  ): Promise<BikePageDto> {
+    return this.bikes.list(query, user);
   }
 
   @Get(':id')
@@ -73,8 +76,11 @@ export class BikesController {
   })
   @ApiOkResponse({ type: BikeDetailDto })
   @ApiNotFoundResponse({ description: 'Bike not found' })
-  get(@Param('id', ParseUUIDPipe) id: string): Promise<BikeDetailDto> {
-    return this.bikes.get(id);
+  get(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedStaff,
+  ): Promise<BikeDetailDto> {
+    return this.bikes.get(id, user);
   }
 
   @Patch(':id')

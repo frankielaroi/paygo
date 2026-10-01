@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { PaginationMetaDto } from '../../common/dto/paginated-response.dto';
+import { RIDER_STANDINGS, type RiderStanding } from '../rider-standing';
 import {
   AssignmentEndReason,
   ContactType,
@@ -56,6 +57,14 @@ export class CustomerSummaryDto {
 
   @ApiProperty()
   createdAt!: Date;
+
+  @ApiProperty({
+    enum: RIDER_STANDINGS,
+    description:
+      'active: holds a bike and is up to date. overdue: owes past grace on a held bike (the ' +
+      "same arrears as the dashboard's overdue queue). no-bike: holds nothing right now.",
+  })
+  standing!: RiderStanding;
 }
 
 export class ContactDto {
@@ -162,10 +171,28 @@ export class CustomerDetailDto extends CustomerSummaryDto {
   risk!: RiderRiskDto;
 }
 
+/** Riders matching the search, by standing, before the standing filter applies. */
+export class RiderCountsDto {
+  @ApiProperty()
+  all!: number;
+
+  @ApiProperty()
+  active!: number;
+
+  @ApiProperty()
+  overdue!: number;
+
+  @ApiProperty()
+  noBike!: number;
+}
+
 export class CustomerPageDto {
   @ApiProperty({ type: CustomerSummaryDto, isArray: true })
   data!: CustomerSummaryDto[];
 
   @ApiProperty({ type: PaginationMetaDto })
   meta!: PaginationMetaDto;
+
+  @ApiProperty({ type: RiderCountsDto })
+  counts!: RiderCountsDto;
 }
