@@ -72,18 +72,23 @@ model User {
   refreshTokens      RefreshToken[]
   enforcementActions EnforcementEvent[]
 
-  trackersInstalled       BikeTrackerInstallation[] @relation("TrackerInstalledBy")
-  trackersRemoved         BikeTrackerInstallation[] @relation("TrackerRemovedBy")
-  bikesAssigned           BikeAssignment[]          @relation("BikeAssignedBy")
-  bikeAssignmentsEnded    BikeAssignment[]          @relation("BikeAssignmentEndedBy")
-  bikeStatusChanges       BikeStatusChange[]        @relation("BikeStatusChangedBy")
-  loansCreated            Loan[]                    @relation("LoanCreatedBy")
-  loansClosed             Loan[]                    @relation("LoanClosedBy")
-  paymentsRecorded        Payment[]                 @relation("PaymentRecordedBy")
-  paymentsAllocated       Payment[]                 @relation("PaymentAllocatedBy")
-  staffAlertsAcknowledged StaffAlert[]              @relation("StaffAlertAcknowledgedBy")
-  staffEventsActed        StaffAuditEvent[]         @relation("StaffAuditActor")
-  staffEventsReceived     StaffAuditEvent[]         @relation("StaffAuditTarget")
+  trackersInstalled       BikeTrackerInstallation[]     @relation("TrackerInstalledBy")
+  trackersRemoved         BikeTrackerInstallation[]     @relation("TrackerRemovedBy")
+  bikesAssigned           BikeAssignment[]              @relation("BikeAssignedBy")
+  bikeAssignmentsEnded    BikeAssignment[]              @relation("BikeAssignmentEndedBy")
+  bikeStatusChanges       BikeStatusChange[]            @relation("BikeStatusChangedBy")
+  loansCreated            Loan[]                        @relation("LoanCreatedBy")
+  loansClosed             Loan[]                        @relation("LoanClosedBy")
+  paymentsRecorded        Payment[]                     @relation("PaymentRecordedBy")
+  paymentsAllocated       Payment[]                     @relation("PaymentAllocatedBy")
+  staffAlertsAcknowledged StaffAlert[]                  @relation("StaffAlertAcknowledgedBy")
+  staffEventsActed        StaffAuditEvent[]             @relation("StaffAuditActor")
+  staffEventsReceived     StaffAuditEvent[]             @relation("StaffAuditTarget")
+  geofencesCreated        Geofence[]                    @relation("GeofenceCreatedBy")
+  policiesUpdated         FleetPolicy[]                 @relation("FleetPolicyUpdatedBy")
+  policyChanges           PolicyChange[]                @relation("PolicyChangeActor")
+  notificationPreferences StaffNotificationPreference[]
+  staffMessages           StaffMessage[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -273,6 +278,8 @@ model Bike {
   loans                Loan[]
   notifications        Notification[]
   staffAlerts          StaffAlert[]
+  geofenceStates       BikeGeofenceState[]
+  geofenceCrossings    GeofenceCrossing[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -411,6 +418,74 @@ model BikeCurrentPosition {
 }
 
 // ---------------------------------------------------------------------------
+// Operating zones
+// ---------------------------------------------------------------------------
+
+/// An operating zone drawn on the fleet map, e.g. "Greater Accra service area". Drawn once and
+/// reused: every new position is checked against every zone. Removed, never deleted, so a past
+/// crossing still names its zone.
+model Geofence {
+  id      String @id @default(uuid()) @db.Uuid
+  name    String
+  /// The outline as [[latitude, longitude], ...]: three or more corners, not closed.
+  polygon Json
+
+  createdById String    @db.Uuid
+  createdBy   User      @relation("GeofenceCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  states    BikeGeofenceState[]
+  crossings GeofenceCrossing[]
+
+  @@index([deletedAt])
+  @@map("geofences")
+}
+
+/// Which side of a zone a bike was last seen on. Exists only to tell a crossing from a bike
+/// that is simply still outside; cleared when the zone is redrawn or removed.
+model BikeGeofenceState {
+  bikeId     String   @db.Uuid
+  bike       Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
+  geofenceId String   @db.Uuid
+  geofence   Geofence @relation(fields: [geofenceId], references: [id], onDelete: Cascade)
+  inside     Boolean
+  /// Device time of the position that put the bike on this side.
+  since      DateTime
+
+  @@id([bikeId, geofenceId])
+  @@index([geofenceId])
+  @@map("bike_geofence_states")
+}
+
+enum GeofenceCrossingDirection {
+  EXITED
+  ENTERED
+}
+
+/// A bike moving from one side of a zone to the other. Append-only; the dashboard's activity
+/// feed reads it.
+model GeofenceCrossing {
+  id         String                    @id @default(uuid()) @db.Uuid
+  geofenceId String                    @db.Uuid
+  geofence   Geofence                  @relation(fields: [geofenceId], references: [id], onDelete: Restrict)
+  bikeId     String                    @db.Uuid
+  bike       Bike                      @relation(fields: [bikeId], references: [id], onDelete: Restrict)
+  direction  GeofenceCrossingDirection
+  /// Where the bike was when it was first seen on the other side.
+  latitude   Float
+  longitude  Float
+  /// Device time of that position.
+  recordedAt DateTime
+  createdAt  DateTime                  @default(now())
+
+  @@index([createdAt])
+  @@index([bikeId, createdAt])
+  @@map("geofence_crossings")
+}
+
+// ---------------------------------------------------------------------------
 // Enforcement
 // ---------------------------------------------------------------------------
 
@@ -514,6 +589,9 @@ enum LoanStatus {
   DEFAULTED
   /// The bike was taken back. Any balance stays owed in the ledger.
   REPOSSESSED
+  /// Staff gave up collecting. What was still owed is recorded as a loss in the ledger, and the
+  /// bike is no longer held by the loan.
+  WRITTEN_OFF
 }
 
 enum LoanFrequency {
@@ -673,12 +751,18 @@ enum LedgerAccount {
   UNALLOCATED_FUNDS
   /// Overpayments owed back to riders.
   RIDER_CREDIT
+  /// What will never be collected on written-off loans. Credited per loan, and set against
+  /// LOAN_RECEIVABLE, which is left untouched so that its credits stay "money paid".
+  LOAN_WRITTEN_OFF
+  /// The loss taken on written-off loans.
+  WRITE_OFF_LOSS
 }
 
 enum LedgerTransactionType {
   LOAN_ORIGINATION
   PAYMENT_RECEIVED
   PAYMENT_ALLOCATED
+  LOAN_WRITE_OFF
 }
 
 /// A balanced group of ledger entries. Append-only: a database trigger refuses UPDATE and DELETE
@@ -810,6 +894,97 @@ model StaffAlert {
 
   @@index([acknowledgedAt, createdAt])
   @@map("staff_alerts")
+}
+
+// ---------------------------------------------------------------------------
+// Fleet policy
+// ---------------------------------------------------------------------------
+
+/// Fleet-wide policy admins change at runtime. One row (id 1), created on first read from the
+/// environment's defaults. The lead time governs every loan; the default terms only prefill the
+/// next loan opened, and never change a loan that already exists.
+model FleetPolicy {
+  id Int @id @default(1)
+
+  /// Hours a rider must have been warned before an overdue bike is locked automatically.
+  lockoutWarningLeadHours Int
+  /// Suggested installment for a new loan, in minor units. Null for no suggestion.
+  defaultInstallmentMinor Int?
+  defaultFrequency        LoanFrequency @default(DAILY)
+  defaultGraceDays        Int           @default(1)
+
+  updatedById String?  @db.Uuid
+  updatedBy   User?    @relation("FleetPolicyUpdatedBy", fields: [updatedById], references: [id], onDelete: Restrict)
+  updatedAt   DateTime @updatedAt
+
+  @@map("fleet_policies")
+}
+
+/// Append-only record of each policy change: who, when, and each field's before and after.
+model PolicyChange {
+  id          String   @id @default(uuid()) @db.Uuid
+  actorUserId String   @db.Uuid
+  actor       User     @relation("PolicyChangeActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+  /// { field: { from, to } }
+  changes     Json
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("policy_changes")
+}
+
+// ---------------------------------------------------------------------------
+// Staff notifications
+// ---------------------------------------------------------------------------
+
+enum StaffNotificationTopic {
+  /// One message a day listing the loans that became overdue that day.
+  LOAN_OVERDUE
+  /// A bike with a rider stopped reporting.
+  BIKE_OFFLINE
+  /// A bike left an operating zone.
+  GEOFENCE_EXIT
+}
+
+/// What one staff member chose to be texted about. No row means off.
+model StaffNotificationPreference {
+  userId    String                 @db.Uuid
+  user      User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  topic     StaffNotificationTopic
+  sms       Boolean                @default(false)
+  updatedAt DateTime               @updatedAt
+
+  @@id([userId, topic])
+  @@map("staff_notification_preferences")
+}
+
+enum StaffMessageStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+/// An alert texted to a staff member. Unique per person and event (dedupeKey), so an event
+/// handled twice texts nobody twice.
+model StaffMessage {
+  id                String                 @id @default(uuid()) @db.Uuid
+  userId            String                 @db.Uuid
+  user              User                   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  topic             StaffNotificationTopic
+  dedupeKey         String
+  recipient         String
+  body              String
+  channel           String
+  status            StaffMessageStatus     @default(PENDING)
+  providerMessageId String?
+  error             String?
+  bikeId            String?                @db.Uuid
+  createdAt         DateTime               @default(now())
+  sentAt            DateTime?
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, createdAt])
+  @@map("staff_messages")
 }
 
 // ---------------------------------------------------------------------------

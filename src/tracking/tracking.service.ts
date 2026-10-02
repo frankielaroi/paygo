@@ -7,9 +7,11 @@ import {
   OnModuleDestroy,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OnEvent } from '@nestjs/event-emitter';
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
 import { Observable, Subject } from 'rxjs';
 import type { Env } from '../config/env.validation';
+import { BIKE_WENT_OFFLINE, type BikeWentOfflineEvent } from '../common/events';
+import { GeofencesService } from '../geofences/geofences.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { DevicePosition } from '../tcp/codec8-parser';
 import { DEVICE_POSITIONS, type DevicePositionsEvent } from '../tcp/tcp.events';
@@ -24,6 +26,9 @@ import { batteryPercentOf, powerAndOdometerOf } from './telemetry';
  * is discarded, while lastReportedAt stays fresh and the bike reads as online and stationary.
  */
 const MAX_DEVICE_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+/** How recently a bike must have crossed the offline threshold to count as having just gone. */
+const JUST_WENT_OFFLINE_MS = 2 * 60 * 1000;
 
 /**
  * The facts Enforcement reads before deciding anything. Two clocks are deliberately separate:
@@ -68,6 +73,8 @@ export class TrackingService
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService<Env, true>,
+    private readonly geofences: GeofencesService,
+    private readonly events: EventEmitter2,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -101,9 +108,9 @@ export class TrackingService
         return;
       }
 
-      const currentChanged = await this.prisma.$transaction(
-        async (transaction) => {
-          await transaction.$executeRaw`
+      // The record that became the bike's current position, or null when none did.
+      const newCurrent = await this.prisma.$transaction(async (transaction) => {
+        await transaction.$executeRaw`
           UPDATE "bikes"
           SET "lastReportedAt" = GREATEST(
             COALESCE("lastReportedAt", ${event.receivedAt}),
@@ -112,37 +119,37 @@ export class TrackingService
           WHERE "id" = ${bike.id}::uuid
         `;
 
-          await transaction.bikePosition.createMany({
-            data: event.records.map((record) =>
-              this.historyData(bike.id, event.receivedAt, record),
-            ),
-            skipDuplicates: true,
-          });
+        await transaction.bikePosition.createMany({
+          data: event.records.map((record) =>
+            this.historyData(bike.id, event.receivedAt, record),
+          ),
+          skipDuplicates: true,
+        });
 
-          const latestAcceptable =
-            event.receivedAt.getTime() + MAX_DEVICE_CLOCK_SKEW_MS;
-          const latestRecord = event.records.reduce<DevicePosition | null>(
-            (latest, record) => {
-              if (record.timestamp.getTime() > latestAcceptable) {
-                this.logger.warn(
-                  `IMEI ${event.imei} sent a record dated ${record.timestamp.toISOString()}, ` +
-                    'ahead of the server clock; kept in history, not used as current',
-                );
-                return latest;
-              }
-              return !latest || record.timestamp > latest.timestamp
-                ? record
-                : latest;
-            },
-            null,
-          );
+        const latestAcceptable =
+          event.receivedAt.getTime() + MAX_DEVICE_CLOCK_SKEW_MS;
+        const latestRecord = event.records.reduce<DevicePosition | null>(
+          (latest, record) => {
+            if (record.timestamp.getTime() > latestAcceptable) {
+              this.logger.warn(
+                `IMEI ${event.imei} sent a record dated ${record.timestamp.toISOString()}, ` +
+                  'ahead of the server clock; kept in history, not used as current',
+              );
+              return latest;
+            }
+            return !latest || record.timestamp > latest.timestamp
+              ? record
+              : latest;
+          },
+          null,
+        );
 
-          if (!latestRecord) {
-            return false;
-          }
+        if (!latestRecord) {
+          return null;
+        }
 
-          const latestPower = powerAndOdometerOf(latestRecord.io);
-          const affected = await transaction.$executeRaw`
+        const latestPower = powerAndOdometerOf(latestRecord.io);
+        const affected = await transaction.$executeRaw`
             INSERT INTO "bike_current_positions" (
               "bikeId", "recordedAt", "receivedAt", "latitude", "longitude",
               "altitude", "angle", "satellites", "speed", "ignition", "movement", "hasFix",
@@ -171,13 +178,21 @@ export class TrackingService
             WHERE "bike_current_positions"."recordedAt" < EXCLUDED."recordedAt"
           `;
 
-          return affected > 0;
-        },
-      );
+        return affected > 0 ? latestRecord : null;
+      });
 
       this.scheduleOfflineNotification(bike.id, event.receivedAt);
 
-      if (currentChanged) {
+      if (newCurrent) {
+        // Without a fix the coordinates are meaningless (0/0), not a place outside a zone.
+        if (newCurrent.hasFix) {
+          await this.geofences.observe(
+            bike.id,
+            newCurrent.latitude,
+            newCurrent.longitude,
+            newCurrent.timestamp,
+          );
+        }
         this.positionUpdates.next(await this.getBikeStatus(bike.id));
       }
     } catch (error) {
@@ -229,6 +244,7 @@ export class TrackingService
     from: Date,
     to: Date,
     limit: number,
+    keep: 'oldest' | 'newest' = 'oldest',
   ): Promise<BikePositionDto[]> {
     if (from > to) {
       throw new BadRequestException('from must be earlier than or equal to to');
@@ -243,9 +259,11 @@ export class TrackingService
       throw new NotFoundException('Bike not found');
     }
 
-    return this.prisma.bikePosition.findMany({
+    // Always returned oldest first. When the window holds more than `limit`, `keep` decides
+    // which end survives: a route up to now wants the newest.
+    const rows = await this.prisma.bikePosition.findMany({
       where: { bikeId, recordedAt: { gte: from, lte: to } },
-      orderBy: { recordedAt: 'asc' },
+      orderBy: { recordedAt: keep === 'newest' ? 'desc' : 'asc' },
       take: limit,
       select: {
         id: true,
@@ -264,6 +282,7 @@ export class TrackingService
         odometerMeters: true,
       },
     });
+    return keep === 'newest' ? rows.reverse() : rows;
   }
 
   async getSafetySnapshot(
@@ -379,11 +398,32 @@ export class TrackingService
       }
 
       this.positionUpdates.next(status);
+      this.announceIfJustWentOffline(bikeId, status.lastReportedAt);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       this.logger.warn(
         `Could not publish offline status for bike ${bikeId}: ${detail}`,
       );
+    }
+  }
+
+  /**
+   * Tells the rest of the system a bike has gone quiet, but only at the moment it happens. At
+   * startup this runs for every bike that has been silent for days; those are not news.
+   */
+  private announceIfJustWentOffline(
+    bikeId: string,
+    lastReportedAt: Date | null,
+  ): void {
+    if (!lastReportedAt) {
+      return;
+    }
+    const timeoutMs =
+      this.config.get('TRACKING_OFFLINE_AFTER_SECONDS', { infer: true }) * 1000;
+    const offlineFor = Date.now() - lastReportedAt.getTime() - timeoutMs;
+    if (offlineFor >= 0 && offlineFor < JUST_WENT_OFFLINE_MS) {
+      const event: BikeWentOfflineEvent = { bikeId, lastReportedAt };
+      this.events.emit(BIKE_WENT_OFFLINE, event);
     }
   }
 

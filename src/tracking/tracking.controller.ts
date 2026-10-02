@@ -65,6 +65,7 @@ export class TrackingController {
       new Date(query.from),
       new Date(query.to),
       query.limit,
+      query.keep,
     );
   }
 

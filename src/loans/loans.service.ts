@@ -26,6 +26,11 @@ import type {
   LoanSummaryDto,
 } from './dto/loan.dto';
 import { LoanArrearsService, type LoanPosition } from './loan-arrears.service';
+import {
+  installmentStateOf,
+  loanStandingOf,
+  type LoanStanding,
+} from './loan-standing';
 import { generateSchedule } from './schedule';
 
 const summarySelect = {
@@ -42,9 +47,27 @@ const summarySelect = {
   endDate: true,
   installmentCount: true,
   createdAt: true,
+  customer: {
+    select: { id: true, firstName: true, lastName: true, phone: true },
+  },
+  bike: {
+    select: {
+      id: true,
+      label: true,
+      registrationNumber: true,
+      make: true,
+      model: true,
+    },
+  },
 } satisfies Prisma.LoanSelect;
 
 type SummaryRow = Prisma.LoanGetPayload<{ select: typeof summarySelect }>;
+
+interface NextDue {
+  sequence: number;
+  dueDate: string;
+  owingMinor: number;
+}
 
 /**
  * Loans: the terms, the schedule generated from them, and the lifecycle. Money never moves here
@@ -61,9 +84,10 @@ export class LoansService {
   ) {}
 
   /**
-   * Starts a loan on a bike already assigned to the rider, generates the whole schedule, and posts
-   * the origination to the ledger, all in one transaction. The last due date is the loan's end
-   * date by construction.
+   * Starts a loan, generates the whole schedule, and posts the origination to the ledger, all in
+   * one transaction. The bike is either already with this rider or in stock; a bike in stock is
+   * assigned to the rider in the same transaction. A rider holds one open loan at a time. The
+   * last due date is the loan's end date by construction.
    */
   async create(
     input: CreateLoanDto,
@@ -86,6 +110,9 @@ export class LoansService {
 
     try {
       const loanId = await this.prisma.$transaction(async (tx) => {
+        // The rider row is locked so two loans for one rider are checked one after the other;
+        // without it both could see "no open loan" and both be created.
+        await tx.$queryRaw`SELECT "id" FROM "customers" WHERE "id" = ${input.customerId}::uuid FOR UPDATE`;
         const rider = await tx.customer.findUnique({
           where: { id: input.customerId },
           select: { status: true },
@@ -98,16 +125,31 @@ export class LoansService {
             `A rider who is ${rider.status.toLowerCase()} cannot take a loan`,
           );
         }
+        const openLoan = await tx.loan.findFirst({
+          where: { customerId: input.customerId, status: { in: OPEN } },
+          select: { id: true },
+        });
+        if (openLoan) {
+          throw new ConflictException(
+            'This rider already has an open loan; it must be closed before another starts',
+          );
+        }
 
-        const assignment = await tx.bikeAssignment.findFirst({
+        const held = await tx.bikeAssignment.findFirst({
           where: { bikeId: input.bikeId, endedAt: null },
           select: { id: true, customerId: true },
         });
-        if (!assignment || assignment.customerId !== input.customerId) {
-          throw new ConflictException(
-            'Assign the bike to this rider before starting a loan on it',
-          );
+        if (held && held.customerId !== input.customerId) {
+          throw new ConflictException('This bike is assigned to another rider');
         }
+        const assignment = held ?? {
+          id: await this.bikes.assignUnderLoan(
+            tx,
+            input.bikeId,
+            input.customerId,
+            actor.id,
+          ),
+        };
 
         const loan = await tx.loan.create({
           data: {
@@ -151,7 +193,11 @@ export class LoansService {
       return this.get(loanId, actor);
     } catch (error) {
       if (isUniqueViolation(error)) {
-        throw new ConflictException('This bike already has an open loan');
+        // Either unique index can fire here: the bike's open loan, or its open assignment
+        // when someone else assigned it at the same moment.
+        throw new ConflictException(
+          'This bike already has an open loan or was just assigned; reload and try again',
+        );
       }
       throw error;
     }
@@ -161,31 +207,82 @@ export class LoansService {
     query: LoanQueryDto,
     actor: AuthenticatedStaff,
   ): Promise<LoanPageDto> {
+    const contains = (word: string) => ({
+      contains: word,
+      mode: 'insensitive' as const,
+    });
     const where: Prisma.LoanWhereInput = {
       ...this.scope(actor),
       ...(query.status ? { status: query.status } : {}),
       ...(query.customerId ? { customerId: query.customerId } : {}),
       ...(query.bikeId ? { bikeId: query.bikeId } : {}),
+      // Every word must match the rider's name or the bike's plate or label.
+      AND: searchWords(query.search).map((word) => ({
+        OR: [
+          { customer: { firstName: contains(word) } },
+          { customer: { lastName: contains(word) } },
+          { bike: { registrationNumber: contains(word) } },
+          { bike: { label: contains(word) } },
+        ],
+      })),
     };
 
-    const [rows, total] = await Promise.all([
+    // Standing is derived from arrears, so every loan matching the search is loaded and the
+    // standing filter and paging apply in memory, as for riders. Fine for a few thousand
+    // loans; beyond that, persist the standing and filter in the database.
+    const now = new Date();
+    const [rows, overdue] = await Promise.all([
       this.prisma.loan.findMany({
         where,
         select: summarySelect,
         orderBy: { [query.sortBy ?? 'createdAt']: query.sortOrder ?? 'desc' },
-        skip: query.skip,
-        take: query.limit,
       }),
-      this.prisma.loan.count({ where }),
+      this.arrears.findOverdue(now),
     ]);
+    const overdueByLoan = new Map(
+      overdue.map((row) => [
+        row.detail.loanId,
+        Number(row.detail.overdueMinor),
+      ]),
+    );
+    const standings = rows.map((row) => ({
+      row,
+      standing: loanStandingOf(row.status, overdueByLoan.get(row.id) ?? 0),
+    }));
+    const matching = standings.filter(
+      ({ standing }) => !query.standing || standing === query.standing,
+    );
+    const page = matching.slice(query.skip, query.skip + query.limit);
 
-    const now = new Date();
+    // Balances and the next installment are read only for the page being returned.
+    const nextDue = await this.nextDueByLoan(page.map(({ row }) => row.id));
     const data = await Promise.all(
-      rows.map(async (row) =>
-        toSummary(row, await this.arrears.positionOf(this.prisma, row, now)),
+      page.map(async ({ row, standing }) =>
+        toSummary(
+          row,
+          await this.arrears.positionOf(this.prisma, row, now),
+          standing,
+          nextDue.get(row.id) ?? null,
+        ),
       ),
     );
-    return new PaginatedResponseDto(data, total, query.page, query.limit);
+
+    const count = (standing: LoanStanding): number =>
+      standings.filter((loan) => loan.standing === standing).length;
+    return Object.assign(
+      new PaginatedResponseDto(data, matching.length, query.page, query.limit),
+      {
+        counts: {
+          all: standings.length,
+          onTrack: count('on-track'),
+          overdue: count('overdue'),
+          completed: count('completed'),
+          defaulted: count('defaulted'),
+          repossessed: count('repossessed'),
+          writtenOff: count('written-off'),
+        },
+      },
+    );
   }
 
   async get(id: string, actor: AuthenticatedStaff): Promise<LoanDetailDto> {
@@ -199,6 +296,7 @@ export class LoansService {
         completedAt: true,
         closedAt: true,
         closedReason: true,
+        assignment: { select: { endedAt: true } },
         installments: {
           orderBy: { sequence: 'asc' },
           select: {
@@ -215,6 +313,7 @@ export class LoansService {
             id: true,
             provider: true,
             providerReference: true,
+            channel: true,
             amountMinor: true,
             currency: true,
             paidAt: true,
@@ -228,36 +327,74 @@ export class LoansService {
       throw new NotFoundException('Loan not found');
     }
 
-    const position = await this.arrears.positionOf(
-      this.prisma,
-      loan,
-      new Date(),
-    );
+    const now = new Date();
+    const position = await this.arrears.positionOf(this.prisma, loan, now);
     const next = loan.installments.find(
       (installment) => installment.paidMinor < installment.amountMinor,
     );
 
     return {
-      ...toSummary(loan, position),
+      ...toSummary(
+        loan,
+        position,
+        loanStandingOf(loan.status, position.overdueMinor),
+        next && isOpen(loan.status)
+          ? {
+              sequence: next.sequence,
+              dueDate: isoDay(next.dueDate),
+              owingMinor: next.amountMinor - next.paidMinor,
+            }
+          : null,
+      ),
       downPaymentMinor: loan.downPaymentMinor,
       assignmentId: loan.assignmentId,
       createdById: loan.createdById,
       completedAt: loan.completedAt,
       closedAt: loan.closedAt,
       closedReason: loan.closedReason,
-      nextDue: next
-        ? {
-            sequence: next.sequence,
-            dueDate: isoDay(next.dueDate),
-            owingMinor: next.amountMinor - next.paidMinor,
-          }
-        : null,
+      assignmentEndedAt: loan.assignment.endedAt,
       schedule: loan.installments.map((installment) => ({
         ...installment,
         dueDate: isoDay(installment.dueDate),
+        state: installmentStateOf(installment, loan.graceDays, now),
       })),
       payments: loan.payments,
     };
+  }
+
+  /** The oldest installment not fully paid, for each open loan among `loanIds`. */
+  private async nextDueByLoan(
+    loanIds: string[],
+  ): Promise<Map<string, NextDue>> {
+    if (loanIds.length === 0) {
+      return new Map();
+    }
+    const unpaid = await this.prisma.loanInstallment.findMany({
+      where: {
+        loanId: { in: loanIds },
+        loan: { status: { in: OPEN } },
+        paidMinor: { lt: this.prisma.loanInstallment.fields.amountMinor },
+      },
+      orderBy: [{ loanId: 'asc' }, { sequence: 'asc' }],
+      distinct: ['loanId'],
+      select: {
+        loanId: true,
+        sequence: true,
+        dueDate: true,
+        amountMinor: true,
+        paidMinor: true,
+      },
+    });
+    return new Map(
+      unpaid.map((installment) => [
+        installment.loanId,
+        {
+          sequence: installment.sequence,
+          dueDate: isoDay(installment.dueDate),
+          owingMinor: installment.amountMinor - installment.paidMinor,
+        },
+      ]),
+    );
   }
 
   /** Declares an active loan in default. It stays collectable and stays enforced. */
@@ -300,10 +437,7 @@ export class LoansService {
         select: { bikeId: true },
       });
       const moved = await tx.loan.updateMany({
-        where: {
-          id,
-          status: { in: [LoanStatus.ACTIVE, LoanStatus.DEFAULTED] },
-        },
+        where: { id, status: { in: OPEN } },
         data: {
           status: LoanStatus.REPOSSESSED,
           closedAt: new Date(),
@@ -315,6 +449,62 @@ export class LoansService {
         throw new ConflictException('Only an open loan can be repossessed');
       }
       await this.bikes.repossessUnderLoan(tx, loan.bikeId, reason, actor.id);
+    });
+    return this.get(id, actor);
+  }
+
+  /**
+   * Gives up collecting an open loan. What is still owed is posted to the ledger as a loss, the
+   * loan closes as WRITTEN_OFF, and the bike is no longer held by it: it can be returned to
+   * stock, retired, or financed again. The rider's assignment is left as it is, because who
+   * physically has the bike is a separate fact that staff record on the bike.
+   *
+   * Nothing is paid and nothing is deleted: the receivable keeps every payment, and the loss
+   * sits in its own account. A staff lock on the bike stays; a lock for arrears lifts at the
+   * next sweep, since nothing is overdue any more.
+   */
+  async writeOff(
+    id: string,
+    reason: string,
+    actor: AuthenticatedStaff,
+  ): Promise<LoanDetailDto> {
+    await this.requireVisible(id, actor);
+    await this.prisma.$transaction(async (tx) => {
+      // Locked so a payment landing at the same moment is applied before or refused after,
+      // never counted in the amount written off and then applied as well.
+      await tx.$queryRaw`SELECT "id" FROM "loans" WHERE "id" = ${id}::uuid FOR UPDATE`;
+      const loan = await tx.loan.findUnique({
+        where: { id },
+        select: { status: true, currency: true },
+      });
+      if (!loan || !isOpen(loan.status)) {
+        throw new ConflictException('Only an open loan can be written off');
+      }
+      const { owedMinor } = await this.ledger.loanReceivable(tx, id);
+
+      await this.ledger.post(tx, {
+        type: LedgerTransactionType.LOAN_WRITE_OFF,
+        description: `Loan written off: ${reason}`,
+        currency: loan.currency,
+        loanId: id,
+        lines: [
+          { account: LedgerAccount.WRITE_OFF_LOSS, debitMinor: owedMinor },
+          {
+            account: LedgerAccount.LOAN_WRITTEN_OFF,
+            loanId: id,
+            creditMinor: owedMinor,
+          },
+        ],
+      });
+      await tx.loan.update({
+        where: { id },
+        data: {
+          status: LoanStatus.WRITTEN_OFF,
+          closedAt: new Date(),
+          closedById: actor.id,
+          closedReason: reason,
+        },
+      });
     });
     return this.get(id, actor);
   }
@@ -344,12 +534,31 @@ export function isoDay(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
-function toSummary(loan: SummaryRow, position: LoanPosition): LoanSummaryDto {
+/** An open loan still takes payments, is still enforced, and still holds its bike. */
+const OPEN: LoanStatus[] = [LoanStatus.ACTIVE, LoanStatus.DEFAULTED];
+
+function isOpen(status: LoanStatus): boolean {
+  return OPEN.includes(status);
+}
+
+function searchWords(search: string | undefined): string[] {
+  return (search ?? '').trim().split(/\s+/).filter(Boolean).slice(0, 5);
+}
+
+function toSummary(
+  loan: SummaryRow,
+  position: LoanPosition,
+  standing: LoanStanding,
+  nextDue: NextDue | null,
+): LoanSummaryDto {
   return {
     id: loan.id,
     customerId: loan.customerId,
     bikeId: loan.bikeId,
+    rider: loan.customer,
+    bike: loan.bike,
     status: loan.status,
+    standing,
     currency: loan.currency,
     principalMinor: loan.principalMinor,
     installmentMinor: loan.installmentMinor,
@@ -359,6 +568,7 @@ function toSummary(loan: SummaryRow, position: LoanPosition): LoanSummaryDto {
     endDate: isoDay(loan.endDate),
     installmentCount: loan.installmentCount,
     balance: position,
+    nextDue,
     createdAt: loan.createdAt,
   };
 }

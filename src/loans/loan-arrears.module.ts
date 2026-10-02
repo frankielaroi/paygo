@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { LedgerModule } from '../ledger/ledger.module';
+import { SettingsModule } from '../settings/settings.module';
 import { LoanArrearsService } from './loan-arrears.service';
 
 /**
@@ -7,7 +8,7 @@ import { LoanArrearsService } from './loan-arrears.service';
  * LoansModule imports enforcement to trigger restores, so the two cannot share a module.
  */
 @Module({
-  imports: [LedgerModule],
+  imports: [LedgerModule, SettingsModule],
   providers: [LoanArrearsService],
   exports: [LoanArrearsService],
 })

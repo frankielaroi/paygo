@@ -10,10 +10,12 @@ import {
   type MessageChannel,
 } from './channels/message-channel';
 import { EnforcementNotifierService } from './enforcement-notifier.service';
+import { MeNotificationsController } from './me-notifications.controller';
 import { NotificationSchedulerService } from './notification-scheduler.service';
 import { NotificationsController } from './notifications.controller';
 import { NotificationsService } from './notifications.service';
 import { StaffAlertsService } from './staff-alerts.service';
+import { StaffNotifierService } from './staff-notifier.service';
 
 /**
  * Picks the delivery channel once, at boot. Arkesel when a key is set; otherwise the log channel
@@ -46,7 +48,11 @@ function channelFactory(config: ConfigService<Env, true>): MessageChannel {
 
 @Module({
   imports: [LoanArrearsModule],
-  controllers: [NotificationsController, ArkeselCallbackController],
+  controllers: [
+    NotificationsController,
+    ArkeselCallbackController,
+    MeNotificationsController,
+  ],
   providers: [
     {
       provide: MESSAGE_CHANNEL,
@@ -55,6 +61,7 @@ function channelFactory(config: ConfigService<Env, true>): MessageChannel {
     },
     NotificationsService,
     StaffAlertsService,
+    StaffNotifierService,
     NotificationSchedulerService,
     EnforcementNotifierService,
   ],

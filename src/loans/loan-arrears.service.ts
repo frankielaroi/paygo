@@ -1,16 +1,16 @@
 import { Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import type { Env } from '../config/env.validation';
 import type { ArrearsSource, OverdueBike } from '../enforcement/arrears-source';
 import type { Prisma } from '../generated/prisma/client';
 import { LedgerService } from '../ledger/ledger.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PoliciesService } from '../settings/policies.service';
 import { overdueMinor, utcDay } from './schedule';
 
 /** Where a loan stands right now. Derived on every call; nothing here is cached. */
 export interface LoanPosition {
   lentMinor: number;
   paidMinor: number;
+  writtenOffMinor: number;
   owedMinor: number;
   overdueMinor: number;
 }
@@ -36,21 +36,21 @@ export class LoanArrearsService implements ArrearsSource {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ledger: LedgerService,
-    private readonly config: ConfigService<Env, true>,
+    private readonly policies: PoliciesService,
   ) {}
 
   /**
    * Every open loan (ACTIVE or DEFAULTED) with money overdue past its grace period as of
-   * `asOf`. Completed and repossessed loans never appear. One query for the whole fleet.
+   * `asOf`. Completed, repossessed and written-off loans never appear. One query for the whole
+   * fleet.
    */
   async findOverdue(asOf: Date): Promise<OverdueBike[]> {
     const today = isoDay(asOf);
+    // Read from the fleet policy on every call, so a change made in Settings applies at the
+    // next sweep with no restart.
+    const leadHours = await this.policies.lockoutWarningLeadHours();
     const warnedBy = isoTimestamp(
-      new Date(
-        asOf.getTime() -
-          this.config.get('LOCKOUT_WARNING_LEAD_HOURS', { infer: true }) *
-            3_600_000,
-      ),
+      new Date(asOf.getTime() - leadHours * 3_600_000),
     );
     // lockable: the rider was warned about an installment that is still unpaid, and the
     // warning went out (or failed for a reason specific to the rider, such as an invalid
@@ -117,9 +117,11 @@ export class LoanArrearsService implements ArrearsSource {
     ]);
     return {
       ...receivable,
+      // What was written off is no longer owed, so it is no longer overdue either. Only a
+      // closed loan has any, and findOverdue never looks at a closed loan.
       overdueMinor: overdueMinor(
         schedule,
-        receivable.paidMinor,
+        receivable.paidMinor + receivable.writtenOffMinor,
         loan.graceDays,
         asOf,
       ),

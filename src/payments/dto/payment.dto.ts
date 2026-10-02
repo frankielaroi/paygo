@@ -3,6 +3,7 @@ import { Transform, Type } from 'class-transformer';
 import {
   IsDateString,
   IsEnum,
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
@@ -15,6 +16,14 @@ import {
 import { PaginationMetaDto } from '../../common/dto/paginated-response.dto';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 import { PaymentStatus } from '../../generated/prisma/enums';
+
+/** How money recorded by hand was received. Stored as the payment's channel. */
+export const MANUAL_PAYMENT_METHODS = [
+  'cash',
+  'mobile_money',
+  'bank_transfer',
+] as const;
+export type ManualPaymentMethod = (typeof MANUAL_PAYMENT_METHODS)[number];
 
 const trim = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim() : value;
@@ -49,6 +58,14 @@ export class RecordPaymentDto {
   @IsOptional()
   @IsDateString()
   paidAt?: string;
+
+  @ApiPropertyOptional({
+    enum: MANUAL_PAYMENT_METHODS,
+    description: 'How the money was received',
+  })
+  @IsOptional()
+  @IsIn(MANUAL_PAYMENT_METHODS)
+  method?: ManualPaymentMethod;
 }
 
 export class AllocatePaymentDto {

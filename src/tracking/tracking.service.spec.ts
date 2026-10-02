@@ -1,5 +1,7 @@
 import { ConfigService } from '@nestjs/config';
+import type { EventEmitter2 } from '@nestjs/event-emitter';
 import type { Env } from '../config/env.validation';
+import type { GeofencesService } from '../geofences/geofences.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { DevicePosition } from '../tcp/codec8-parser';
 import type { DevicePositionsEvent } from '../tcp/tcp.events';
@@ -49,6 +51,11 @@ const bikeRow = {
   },
 };
 
+const observe = jest.fn().mockResolvedValue(undefined);
+const geofences = { observe } as unknown as GeofencesService;
+const emit = jest.fn();
+const events = { emit } as unknown as EventEmitter2;
+
 function configWithTimeout(seconds = 300): ConfigService<Env, true> {
   return {
     get: jest.fn(() => seconds),
@@ -56,6 +63,11 @@ function configWithTimeout(seconds = 300): ConfigService<Env, true> {
 }
 
 describe('TrackingService', () => {
+  beforeEach(() => {
+    observe.mockClear();
+    emit.mockClear();
+  });
+
   it('restores offline timers for previously reported bikes at startup', async () => {
     const prisma = {
       bike: {
@@ -65,7 +77,12 @@ describe('TrackingService', () => {
         ]),
       },
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
 
     await service.onApplicationBootstrap();
 
@@ -81,7 +98,12 @@ describe('TrackingService', () => {
       bike: { findUnique: jest.fn().mockResolvedValue(null) },
       $transaction: jest.fn(),
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
 
     await expect(service.handleDevicePositions(event)).resolves.toBeUndefined();
 
@@ -119,7 +141,12 @@ describe('TrackingService', () => {
           callback(transaction),
       ),
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
     const received: BikeStatusDto[] = [];
     service.watchPositionUpdates().subscribe((update) => received.push(update));
 
@@ -139,6 +166,46 @@ describe('TrackingService', () => {
     expect(received[0]?.bikeId).toBe('bike-1');
     expect(received[0]?.current?.speed).toBe(0);
     expect(received[0]?.current?.ignition).toBe(false);
+    // The position that became current is checked against the operating zones.
+    expect(observe).toHaveBeenCalledWith(
+      'bike-1',
+      position.latitude,
+      position.longitude,
+      position.timestamp,
+    );
+    service.onModuleDestroy();
+  });
+
+  it('does not check zones for a position without a GPS fix', async () => {
+    const transaction = {
+      $executeRaw: jest.fn().mockResolvedValueOnce(1).mockResolvedValueOnce(1),
+      bikePosition: { createMany: jest.fn() },
+    };
+    const prisma = {
+      bike: {
+        findUnique: jest
+          .fn()
+          .mockResolvedValueOnce({ id: 'bike-1' })
+          .mockResolvedValueOnce(bikeRow),
+      },
+      $transaction: jest.fn(
+        async (callback: (client: typeof transaction) => Promise<unknown>) =>
+          callback(transaction),
+      ),
+    } as unknown as PrismaService;
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
+
+    await service.handleDevicePositions({
+      ...event,
+      records: [{ ...position, latitude: 0, longitude: 0, hasFix: false }],
+    });
+
+    expect(observe).not.toHaveBeenCalled();
     service.onModuleDestroy();
   });
 
@@ -154,7 +221,12 @@ describe('TrackingService', () => {
           callback(transaction),
       ),
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
     const received: BikeStatusDto[] = [];
     service.watchPositionUpdates().subscribe((update) => received.push(update));
 
@@ -195,7 +267,12 @@ describe('TrackingService', () => {
         ),
       } as unknown as PrismaService;
       return {
-        service: new TrackingService(prisma, configWithTimeout()),
+        service: new TrackingService(
+          prisma,
+          configWithTimeout(),
+          geofences,
+          events,
+        ),
         executeRaw,
       };
     }
@@ -263,7 +340,12 @@ describe('TrackingService', () => {
           callback(transaction),
       ),
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
 
     await Promise.all([
       service.handleDevicePositions({ ...event, imei: '356307042441013' }),
@@ -287,7 +369,12 @@ describe('TrackingService', () => {
         }),
       },
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
 
     await expect(service.getBikeStatus('bike-1')).resolves.toMatchObject({
       bikeId: 'bike-1',
@@ -320,7 +407,12 @@ describe('TrackingService', () => {
           callback(transaction),
       ),
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout(1));
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(1),
+      geofences,
+      events,
+    );
     const received: BikeStatusDto[] = [];
     service.watchPositionUpdates().subscribe((update) => received.push(update));
 
@@ -330,6 +422,11 @@ describe('TrackingService', () => {
     await jest.advanceTimersByTimeAsync(1002);
 
     expect(received.map((status) => status.online)).toEqual([true, false]);
+    // The moment it goes quiet is announced, so staff who asked can be told.
+    expect(emit).toHaveBeenCalledWith('bike.went-offline', {
+      bikeId: 'bike-1',
+      lastReportedAt: receivedAt,
+    });
     service.onModuleDestroy();
     jest.useRealTimers();
   });
@@ -340,7 +437,12 @@ describe('TrackingService', () => {
       bike: { findUnique: jest.fn().mockResolvedValue({ id: 'bike-1' }) },
       bikePosition: { findMany: jest.fn().mockResolvedValue(positions) },
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
     const from = new Date('2026-09-29T11:00:00.000Z');
     const to = new Date('2026-09-29T13:00:00.000Z');
 
@@ -383,7 +485,12 @@ describe('TrackingService', () => {
         }),
       },
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
 
     await expect(service.getSafetySnapshot('bike-1')).resolves.toMatchObject({
       bikeId: 'bike-1',
@@ -403,7 +510,12 @@ describe('TrackingService', () => {
         }),
       },
     } as unknown as PrismaService;
-    const service = new TrackingService(prisma, configWithTimeout());
+    const service = new TrackingService(
+      prisma,
+      configWithTimeout(),
+      geofences,
+      events,
+    );
 
     await expect(service.getSafetySnapshot('bike-1')).resolves.toBeNull();
   });

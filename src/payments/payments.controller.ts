@@ -99,6 +99,7 @@ export class PaymentsController {
       amountMinor: input.amountMinor,
       currency: input.currency,
       paidAt: input.paidAt ? new Date(input.paidAt) : new Date(),
+      channel: input.method ?? null,
       recordedById: user.id,
     });
   }

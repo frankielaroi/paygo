@@ -86,7 +86,13 @@ export class StaffActivityService {
       this.prisma.loan.findMany({
         where: {
           closedById: userId,
-          status: { in: [LoanStatus.DEFAULTED, LoanStatus.REPOSSESSED] },
+          status: {
+            in: [
+              LoanStatus.DEFAULTED,
+              LoanStatus.REPOSSESSED,
+              LoanStatus.WRITTEN_OFF,
+            ],
+          },
           ...at('updatedAt'),
         },
         orderBy: { updatedAt: 'desc' },
@@ -220,12 +226,9 @@ export class StaffActivityService {
       ...loansClosed.map((row) => ({
         ...blank,
         at: row.closedAt ?? row.updatedAt,
-        action:
-          row.status === LoanStatus.REPOSSESSED
-            ? 'LOAN_REPOSSESSED'
-            : 'LOAN_DEFAULTED',
+        action: LOAN_CLOSURE[row.status]?.action ?? 'LOAN_DEFAULTED',
         summary:
-          `${row.status === LoanStatus.REPOSSESSED ? 'Repossessed under' : 'Declared in default'} a loan: ${row.closedReason ?? ''}`.trim(),
+          `${LOAN_CLOSURE[row.status]?.verb ?? 'Closed'} a loan: ${row.closedReason ?? ''}`.trim(),
         loanId: row.id,
         bikeId: row.bikeId,
         customerId: row.customerId,
@@ -343,3 +346,18 @@ function money(minor: number, currency: string): string {
   const whole = Math.floor(minor / 100);
   return `${currency} ${whole}.${String(minor % 100).padStart(2, '0')}`;
 }
+
+/** How a loan closed by staff reads in their activity. */
+const LOAN_CLOSURE: Partial<
+  Record<LoanStatus, { action: string; verb: string }>
+> = {
+  [LoanStatus.DEFAULTED]: {
+    action: 'LOAN_DEFAULTED',
+    verb: 'Declared in default',
+  },
+  [LoanStatus.REPOSSESSED]: {
+    action: 'LOAN_REPOSSESSED',
+    verb: 'Repossessed under',
+  },
+  [LoanStatus.WRITTEN_OFF]: { action: 'LOAN_WRITTEN_OFF', verb: 'Wrote off' },
+};
