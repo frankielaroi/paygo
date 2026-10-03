@@ -1,8 +1,24 @@
 # Build and deploy the PayGo API to Azure App Service (Linux).
 #
-# Required repository secret:
-#   AZURE_WEBAPP_PUBLISH_PROFILE  the publish profile XML from the App Service
-#                                 ("Get publish profile" in the portal overview).
+# This workflow uses no third-party actions: frankielaroi/paygo restricts Actions
+# to repositories owned by frankielaroi, which excludes actions/* and azure/* too.
+# Checkout is a plain git fetch with the job's own token, Node comes from the
+# runner's nvm, and the deploy goes through the Azure CLI, which is preinstalled
+# on the ubuntu-latest image. Build and deploy share one job because passing an
+# artifact between jobs would need actions/upload-artifact.
+#
+# Required repository secrets (service principal with Contributor on the app):
+#   AZURE_CLIENT_ID
+#   AZURE_CLIENT_SECRET
+#   AZURE_TENANT_ID
+#   DATABASE_URL            only for the manual migrate job
+#
+#   az ad sp create-for-rbac --name paygo-deploy \
+#     --role contributor \
+#     --scopes /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Web/sites/fleet
+#
+# "az webapp deploy" authenticates with that AAD identity, so the App Service can
+# keep SCM basic authentication disabled.
 #
 # App Service settings to configure once, in the portal (not here):
 #   - Startup Command: node dist/main.js
@@ -10,12 +26,12 @@
 #     dependency that is pruned out of the deployed bundle).
 #   - Every variable in .env.example, DATABASE_URL and the JWT keys included.
 #     The bootstrap validates the environment with zod and aborts on a missing key.
-#   - WEBSITES_PORT only if the app is not reading PORT (main.ts falls back to 3000).
-#
-# The raw TCP device listener (TCP_DEVICE_PORT, default 5027) is not reachable
-# through App Service, which only exposes HTTP(S). Set TCP_DEVICE_ENABLED=false
-# here and run the device listener where a plain TCP port can be published
-# (Container Apps, AKS, or a VM), or the devices will never connect.
+#   - TCP_DEVICE_ENABLED=false. App Service publishes only HTTP(S), so the raw
+#     Teltonika listener on TCP_DEVICE_PORT cannot be reached here; run the device
+#     listener where a plain TCP port can be exposed (Container Apps, AKS, a VM).
+#   - One instance only. A device socket lives on exactly one process, so a second
+#     replica makes sendCommand report "not connected" for devices attached to the
+#     other one, which silently skips an immobilization.
 
 name: Build and deploy Node.js app to Azure Web App - fleet
 
@@ -27,20 +43,34 @@ on:
 
 env:
   AZURE_WEBAPP_NAME: fleet
-  NODE_VERSION: '22.x'
+  AZURE_RESOURCE_GROUP: paygo
+  NODE_VERSION: '22'
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
+    environment:
+      name: production
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the pushed commit
+        run: |
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "${{ github.token }}" | base64 -w0)" \
+            fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --quiet FETCH_HEAD
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+      - name: Select Node.js ${{ env.NODE_VERSION }}
+        run: |
+          . "${NVM_DIR}/nvm.sh"
+          nvm install "${NODE_VERSION}"
+          # Later steps get their own shell, so publish the chosen bin directory
+          # on PATH rather than relying on nvm's shell state.
+          echo "$(nvm which "${NODE_VERSION}" | xargs dirname)" >> "${GITHUB_PATH}"
+
+      - name: Report the toolchain
+        run: node --version && npm --version
 
       - name: Install dependencies
         run: npm ci
@@ -70,62 +100,67 @@ jobs:
 
       - name: Package the release
         run: |
-          zip -r release.zip \
+          zip -r -q release.zip \
             dist \
             node_modules \
             prisma \
             package.json \
             package-lock.json \
             -x 'prisma/seed.ts'
+          ls -lh release.zip
 
-      - name: Upload the artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: node-app
-          path: release.zip
-          retention-days: 7
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    environment:
-      name: production
-      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
-
-    steps:
-      - name: Download the artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: node-app
+      - name: Sign in to Azure
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          az login --service-principal \
+            --username "${AZURE_CLIENT_ID}" \
+            --password "${AZURE_CLIENT_SECRET}" \
+            --tenant "${AZURE_TENANT_ID}" \
+            --output none
 
       - name: Deploy to Azure Web App
-        id: deploy-to-webapp
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: ${{ env.AZURE_WEBAPP_NAME }}
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          package: release.zip
+        run: |
+          az webapp deploy \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --name "${AZURE_WEBAPP_NAME}" \
+            --src-path release.zip \
+            --type zip \
+            --output none
+          echo "Deployed to https://${AZURE_WEBAPP_NAME}.azurewebsites.net"
+
+      - name: Sign out of Azure
+        if: always()
+        run: az logout --output none || true
 
   # Migrations are deliberately a separate, manually triggered job: an automatic
   # "prisma migrate deploy" on every push applies schema changes before the old
   # revision has stopped serving, and a destructive migration then has no owner.
-  # Run it from the Actions tab after the deploy, with DATABASE_URL set as a secret
-  # and the runner's IP allowed through the database firewall.
+  # Run it from the Actions tab, with the runner's IP allowed through the database
+  # firewall.
   migrate:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    needs: deploy
+    needs: build-and-deploy
     environment:
       name: production
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the pushed commit
+        run: |
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "${{ github.token }}" | base64 -w0)" \
+            fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --quiet FETCH_HEAD
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+      - name: Select Node.js ${{ env.NODE_VERSION }}
+        run: |
+          . "${NVM_DIR}/nvm.sh"
+          nvm install "${NODE_VERSION}"
+          echo "$(nvm which "${NODE_VERSION}" | xargs dirname)" >> "${GITHUB_PATH}"
 
       - name: Install dependencies
         run: npm ci
