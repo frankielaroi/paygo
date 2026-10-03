@@ -14,6 +14,7 @@ export type RepaymentRefusal =
   | 'loan-not-found'
   | 'loan-completed'
   | 'loan-repossessed'
+  | 'loan-written-off'
   | 'currency-mismatch';
 
 export type RepaymentResult =
@@ -83,6 +84,9 @@ export class LoanRepaymentService {
     }
     if (loan.status === LoanStatus.REPOSSESSED) {
       return { kind: 'refused', reason: 'loan-repossessed' };
+    }
+    if (loan.status === LoanStatus.WRITTEN_OFF) {
+      return { kind: 'refused', reason: 'loan-written-off' };
     }
     if (loan.currency !== money.currency) {
       return { kind: 'refused', reason: 'currency-mismatch' };

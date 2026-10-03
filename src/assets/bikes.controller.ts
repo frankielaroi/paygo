@@ -35,7 +35,11 @@ import {
   UpdateBikeDto,
 } from './dto/bike-input.dto';
 import { BikeQueryDto } from './dto/bike-query.dto';
-import { BikeDetailDto, BikePageDto } from './dto/bike-response.dto';
+import {
+  BikeDetailDto,
+  BikeMapDto,
+  BikePageDto,
+} from './dto/bike-response.dto';
 
 @ApiTags('bikes')
 @ApiBearerAuth('bearer')
@@ -67,6 +71,20 @@ export class BikesController {
     @CurrentUser() user: AuthenticatedStaff,
   ): Promise<BikePageDto> {
     return this.bikes.list(query, user);
+  }
+
+  // Declared before :id so "map" is not read as a bike id.
+  @Get('map')
+  @RequirePermissions(Permission.ASSET_READ)
+  @ApiOperation({
+    summary: 'Every trackable bike for the fleet map, unpaged',
+    description:
+      'The same live status and lock controls as GET /bikes, so a marker and a row in the ' +
+      'list can never disagree, plus the operating zones each bike is outside of.',
+  })
+  @ApiOkResponse({ type: BikeMapDto, isArray: true })
+  map(@CurrentUser() user: AuthenticatedStaff): Promise<BikeMapDto[]> {
+    return this.bikes.map(user);
   }
 
   @Get(':id')

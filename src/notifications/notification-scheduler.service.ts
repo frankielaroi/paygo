@@ -11,6 +11,7 @@ import { addDays, utcDay } from '../loans/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { lockoutWarningText, reminderText } from './messages';
 import { NotificationsService } from './notifications.service';
+import { StaffNotifierService } from './staff-notifier.service';
 
 interface DueRow {
   installmentId: string;
@@ -45,6 +46,7 @@ export class NotificationSchedulerService
     private readonly prisma: PrismaService,
     private readonly config: ConfigService<Env, true>,
     private readonly notifications: NotificationsService,
+    private readonly staffNotifier: StaffNotifierService,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -78,6 +80,8 @@ export class NotificationSchedulerService
       if (this.withinMessagingHours(now)) {
         await this.sendReminders(now);
         await this.sendLockoutWarnings(now);
+        // Staff are not texted a digest at night either.
+        await this.staffNotifier.sendOverdueDigest(now);
       }
       await this.notifications.retryPending(now);
     } catch (error) {

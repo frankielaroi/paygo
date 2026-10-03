@@ -19,6 +19,8 @@ import { PaymentsModule } from './payments/payments.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { UsersModule } from './users/users.module';
 import { DashboardModule } from './dashboard/dashboard.module';
+import { GeofencesModule } from './geofences/geofences.module';
+import { SettingsModule } from './settings/settings.module';
 import { type Env, validateEnv } from './config/env.validation';
 import { throttlerOptions } from './config/throttler';
 
@@ -53,6 +55,8 @@ import { throttlerOptions } from './config/throttler';
     NotificationsModule,
     UsersModule,
     DashboardModule,
+    GeofencesModule,
+    SettingsModule,
   ],
   controllers: [AppController],
   providers: [

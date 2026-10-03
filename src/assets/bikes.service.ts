@@ -16,6 +16,7 @@ import {
 } from '../dashboard/fleet-status';
 import { EnforcementService } from '../enforcement/enforcement.service';
 import type { Prisma } from '../generated/prisma/client';
+import { isInsidePolygon, parsePolygon } from '../geofences/geometry';
 import {
   AssignmentEndReason,
   BikeStatus,
@@ -41,6 +42,7 @@ import type {
   BikeCountsDto,
   BikeDetailDto,
   BikeLiveDto,
+  BikeMapDto,
   BikePageDto,
   BikeSummaryDto,
 } from './dto/bike-response.dto';
@@ -265,6 +267,76 @@ export class BikesService {
       new PaginatedResponseDto(page, matching.length, query.page, query.limit),
       { counts: countsOf(bikes) },
     );
+  }
+
+  /**
+   * Every bike that can carry a tracker, for the fleet map. Unpaged on purpose: a map shows the
+   * whole fleet at once. Uses the same live block as the list, so a marker's status is the
+   * status /bikes shows for that bike.
+   */
+  async map(viewer?: AuthenticatedStaff): Promise<BikeMapDto[]> {
+    const now = new Date();
+    const [rows, overdue, zoneRows] = await Promise.all([
+      this.prisma.bike.findMany({
+        where: { status: { in: TRACKABLE } },
+        select: summarySelect,
+        orderBy: { label: 'asc' },
+      }),
+      this.overdueByBike(now),
+      this.prisma.geofence.findMany({
+        where: { deletedAt: null },
+        select: { id: true, polygon: true },
+      }),
+    ]);
+    const canImmobilize = this.canImmobilize(viewer);
+    const zones = zoneRows.flatMap((zone) => {
+      const polygon = parsePolygon(zone.polygon);
+      return polygon ? [{ id: zone.id, polygon }] : [];
+    });
+
+    return rows.map((row) => {
+      const live = this.liveOf(
+        row,
+        overdue.get(row.id) ?? 0,
+        canImmobilize,
+        now,
+      );
+      const rider = row.assignments[0]?.customer;
+      const { latitude, longitude } = live;
+      return {
+        id: row.id,
+        label: row.label,
+        registrationNumber: row.registrationNumber,
+        make: row.make,
+        model: row.model,
+        status: row.status,
+        imei: row.imei,
+        currentRider: rider
+          ? {
+              customerId: rider.id,
+              firstName: rider.firstName,
+              lastName: rider.lastName,
+            }
+          : null,
+        mobility: row.enforcement
+          ? {
+              desiredState: row.enforcement.desiredState,
+              confirmedState: row.enforcement.confirmedState,
+            }
+          : null,
+        live,
+        // Worked out from where the bike is now, so it is right the moment a zone is drawn.
+        outsideZoneIds:
+          latitude === null || longitude === null
+            ? []
+            : zones
+                .filter(
+                  (zone) =>
+                    !isInsidePolygon([latitude, longitude], zone.polygon),
+                )
+                .map((zone) => zone.id),
+      };
+    });
   }
 
   /** A bike and its histories, with the lock controls `viewer` may use (none without one). */
@@ -547,6 +619,34 @@ export class BikesService {
       );
     });
     return this.get(id);
+  }
+
+  /**
+   * For the loans module only, inside the transaction that starts a loan: hands a bike from
+   * stock to the rider, by the same rules as assign, so opening a loan on an unassigned bike is
+   * one step that either happens whole or not at all. Returns the new assignment's id.
+   */
+  async assignUnderLoan(
+    tx: Prisma.TransactionClient,
+    bikeId: string,
+    customerId: string,
+    userId: string,
+  ): Promise<string> {
+    await this.requireBike(tx, bikeId);
+    await this.requireAssignableRider(tx, customerId);
+    await this.moveStatus(
+      tx,
+      bikeId,
+      [BikeStatus.IN_INVENTORY],
+      BikeStatus.ASSIGNED,
+      'Assigned to rider with a new loan',
+      userId,
+    );
+    const assignment = await tx.bikeAssignment.create({
+      data: { bikeId, customerId, assignedById: userId },
+      select: { id: true },
+    });
+    return assignment.id;
   }
 
   /**

@@ -21,6 +21,15 @@ export interface LedgerPosting {
   lines: LedgerLine[];
 }
 
+export interface LoanReceivable {
+  lentMinor: number;
+  paidMinor: number;
+  /** Given up as uncollectable. Zero unless the loan was written off. */
+  writtenOffMinor: number;
+  /** Lent, less paid, less written off. */
+  owedMinor: number;
+}
+
 type Db = Pick<Prisma.TransactionClient, 'ledgerTransaction' | 'ledgerEntry'>;
 
 /**
@@ -87,19 +96,37 @@ export class LedgerService {
   }
 
   /**
-   * A loan's receivable account: what was lent (debits), what has been paid against it (credits),
-   * and what is still owed.
+   * A loan's receivable: what was lent (debits), what has been paid against it (credits), what
+   * was written off, and what is still owed. A write-off is credited to its own account rather
+   * than to the receivable, so "paid" only ever means money received.
    */
   async loanReceivable(
     db: Pick<Prisma.TransactionClient, 'ledgerEntry'>,
     loanId: string,
-  ): Promise<{ lentMinor: number; paidMinor: number; owedMinor: number }> {
-    const totals = await db.ledgerEntry.aggregate({
-      where: { loanId, account: LedgerAccount.LOAN_RECEIVABLE },
+  ): Promise<LoanReceivable> {
+    const totals = await db.ledgerEntry.groupBy({
+      by: ['account'],
+      where: {
+        loanId,
+        account: {
+          in: [LedgerAccount.LOAN_RECEIVABLE, LedgerAccount.LOAN_WRITTEN_OFF],
+        },
+      },
       _sum: { debitMinor: true, creditMinor: true },
     });
-    const lentMinor = totals._sum.debitMinor ?? 0;
-    const paidMinor = totals._sum.creditMinor ?? 0;
-    return { lentMinor, paidMinor, owedMinor: lentMinor - paidMinor };
+    const of = (account: LedgerAccount) =>
+      totals.find((row) => row.account === account)?._sum;
+    const receivable = of(LedgerAccount.LOAN_RECEIVABLE);
+    const writtenOff = of(LedgerAccount.LOAN_WRITTEN_OFF);
+    const lentMinor = receivable?.debitMinor ?? 0;
+    const paidMinor = receivable?.creditMinor ?? 0;
+    const writtenOffMinor =
+      (writtenOff?.creditMinor ?? 0) - (writtenOff?.debitMinor ?? 0);
+    return {
+      lentMinor,
+      paidMinor,
+      writtenOffMinor,
+      owedMinor: lentMinor - paidMinor - writtenOffMinor,
+    };
   }
 }

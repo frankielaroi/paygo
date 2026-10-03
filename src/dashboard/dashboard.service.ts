@@ -10,6 +10,7 @@ import type { Env } from '../config/env.validation';
 import type { Prisma } from '../generated/prisma/client';
 import {
   EnforcementEventType,
+  GeofenceCrossingDirection,
   LoanStatus,
   MobilityState,
   NotificationKind,
@@ -437,7 +438,7 @@ export class DashboardService {
       select: { label: true, registrationNumber: true },
     } as const;
 
-    const [events, messages, payments] = await Promise.all([
+    const [events, messages, payments, crossings] = await Promise.all([
       this.prisma.enforcementEvent.findMany({
         where: {
           ...bikeFilter,
@@ -508,6 +509,20 @@ export class DashboardService {
           allocatedBy: { select: { firstName: true, lastName: true } },
         },
       }),
+      // Bikes crossing an operating zone, recorded as positions arrive (GeofencesService).
+      this.prisma.geofenceCrossing.findMany({
+        where: bikeFilter,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        select: {
+          id: true,
+          direction: true,
+          createdAt: true,
+          bikeId: true,
+          bike: bikeName,
+          geofence: { select: { name: true } },
+        },
+      }),
     ]);
 
     const name = (bike: { label: string; registrationNumber: string | null }) =>
@@ -576,6 +591,17 @@ export class DashboardService {
             (allocated ? payment.allocatedAt : payment.receivedAt) ??
             payment.receivedAt,
           bikeId: payment.loan?.bikeId ?? null,
+        };
+      }),
+      ...crossings.map((crossing) => {
+        const left = crossing.direction === GeofenceCrossingDirection.EXITED;
+        return {
+          id: crossing.id,
+          actor: 'System',
+          action: `flagged ${name(crossing.bike)} ${left ? 'leaving' : 'back in'} ${crossing.geofence.name}`,
+          detail: left ? 'Outside its operating zone' : 'Inside its zone again',
+          at: crossing.createdAt,
+          bikeId: crossing.bikeId,
         };
       }),
     ];

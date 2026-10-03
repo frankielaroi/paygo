@@ -44,7 +44,9 @@ export class LoansController {
   @RequirePermissions(Permission.LOAN_CREATE)
   @ApiOperation({
     summary: 'Start a loan and generate its full schedule',
-    description: 'The bike must already be assigned to the rider.',
+    description:
+      'A bike in stock is assigned to the rider in the same step; a bike the rider already ' +
+      'holds is financed as it is.',
   })
   @ApiCreatedResponse({ type: LoanDetailDto })
   @ApiBadRequestResponse({
@@ -52,7 +54,8 @@ export class LoansController {
   })
   @ApiConflictResponse({
     description:
-      'Bike not assigned to this rider, rider not active, or bike has an open loan',
+      'Rider not active or already has an open loan; bike assigned to someone else, not in ' +
+      'stock, or already under an open loan',
   })
   create(
     @Body() input: CreateLoanDto,
@@ -98,6 +101,27 @@ export class LoansController {
     @CurrentUser() user: AuthenticatedStaff,
   ): Promise<LoanDetailDto> {
     return this.loans.markDefaulted(id, input.reason, user);
+  }
+
+  @Post(':id/write-off')
+  @HttpCode(HttpStatus.OK)
+  @RequirePermissions(Permission.LOAN_MANAGE)
+  @ApiOperation({
+    summary: 'Write off what is still owed and close the loan',
+    description:
+      'Posts the balance to the ledger as a loss and frees the bike from the loan. Payments ' +
+      'already made are untouched. The rider keeps holding the bike until staff end the ' +
+      'assignment on the bike.',
+  })
+  @ApiOkResponse({ type: LoanDetailDto })
+  @ApiNotFoundResponse({ description: 'Loan not found or not yours' })
+  @ApiConflictResponse({ description: 'Loan is not open' })
+  writeOff(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() input: LoanReasonDto,
+    @CurrentUser() user: AuthenticatedStaff,
+  ): Promise<LoanDetailDto> {
+    return this.loans.writeOff(id, input.reason, user);
   }
 
   @Post(':id/repossession')

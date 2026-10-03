@@ -51,6 +51,7 @@ const REFUSAL_TEXT: Record<RepaymentRefusal | 'no-loan-named', string> = {
   'loan-not-found': 'The named loan does not exist',
   'loan-completed': 'The named loan is already fully paid',
   'loan-repossessed': 'The named loan was closed by repossession',
+  'loan-written-off': 'The named loan was written off',
   'currency-mismatch': 'The payment currency differs from the loan currency',
 };
 

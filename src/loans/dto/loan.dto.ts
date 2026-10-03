@@ -21,6 +21,11 @@ import {
   LoanStatus,
   PaymentStatus,
 } from '../../generated/prisma/enums';
+import {
+  LOAN_STANDINGS,
+  type InstallmentState,
+  type LoanStanding,
+} from '../loan-standing';
 
 const trimUpper = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim().toUpperCase() : value;
@@ -29,12 +34,17 @@ const trim = ({ value }: { value: unknown }): unknown =>
 
 export class CreateLoanDto {
   @ApiProperty({
-    description: 'The rider. The bike must already be assigned to them.',
+    description:
+      'The rider: KYC-verified, active, and with no other open loan.',
   })
   @IsUUID()
   customerId!: string;
 
-  @ApiProperty()
+  @ApiProperty({
+    description:
+      'A bike in stock, which is assigned to the rider as the loan starts, or one already ' +
+      'assigned to this rider.',
+  })
   @IsUUID()
   bikeId!: string;
 
@@ -131,6 +141,15 @@ export class LoanQueryDto extends PaginationQueryDto {
   @IsUUID()
   bikeId?: string;
 
+  @ApiPropertyOptional({
+    enum: LOAN_STANDINGS,
+    description:
+      'Where the loan stands today: an active loan is on-track or overdue',
+  })
+  @IsOptional()
+  @IsIn(LOAN_STANDINGS)
+  standing?: LoanStanding;
+
   @ApiPropertyOptional({ enum: LOAN_SORT_FIELDS, default: 'createdAt' })
   @IsOptional()
   @IsIn(LOAN_SORT_FIELDS)
@@ -144,7 +163,18 @@ export class LoanBalanceDto {
   @ApiProperty({ description: 'Total paid against the loan, from the ledger' })
   paidMinor!: number;
 
-  @ApiProperty({ description: 'Still owed' })
+  @ApiProperty({
+    description:
+      'Given up as uncollectable when the loan was written off; 0 otherwise. Never counted ' +
+      'as paid.',
+  })
+  writtenOffMinor!: number;
+
+  @ApiProperty({
+    description:
+      'Still owed: lent, less paid, less written off. On an open loan this is also the ' +
+      'amount that settles it early.',
+  })
   owedMinor!: number;
 
   @ApiProperty({
@@ -169,6 +199,13 @@ export class InstallmentDto {
 
   @ApiProperty({ nullable: true })
   paidAt!: Date | null;
+
+  @ApiProperty({
+    enum: ['paid', 'overdue', 'in-grace', 'due-today', 'upcoming'],
+    description:
+      'in-grace is past its due date but not yet overdue: the grace days have not run out',
+  })
+  state!: InstallmentState;
 }
 
 export class NextDueDto {
@@ -192,6 +229,12 @@ export class LoanPaymentDto {
   @ApiProperty({ description: 'Reference on the provider statement' })
   providerReference!: string;
 
+  @ApiProperty({
+    nullable: true,
+    description: 'How it was paid, e.g. cash or mobile_money',
+  })
+  channel!: string | null;
+
   @ApiProperty()
   amountMinor!: number;
 
@@ -208,6 +251,37 @@ export class LoanPaymentDto {
   overpaidMinor!: number;
 }
 
+export class LoanRiderDto {
+  @ApiProperty()
+  id!: string;
+
+  @ApiProperty()
+  firstName!: string;
+
+  @ApiProperty()
+  lastName!: string;
+
+  @ApiProperty()
+  phone!: string;
+}
+
+export class LoanBikeDto {
+  @ApiProperty()
+  id!: string;
+
+  @ApiProperty({ example: 'ACC-014' })
+  label!: string;
+
+  @ApiProperty({ nullable: true, description: 'The plate' })
+  registrationNumber!: string | null;
+
+  @ApiProperty()
+  make!: string;
+
+  @ApiProperty()
+  model!: string;
+}
+
 export class LoanSummaryDto {
   @ApiProperty()
   id!: string;
@@ -218,8 +292,22 @@ export class LoanSummaryDto {
   @ApiProperty()
   bikeId!: string;
 
+  @ApiProperty({ type: LoanRiderDto })
+  rider!: LoanRiderDto;
+
+  @ApiProperty({ type: LoanBikeDto })
+  bike!: LoanBikeDto;
+
   @ApiProperty({ enum: LoanStatus })
   status!: LoanStatus;
+
+  @ApiProperty({
+    enum: LOAN_STANDINGS,
+    description:
+      'The status as staff see it: an active loan is on-track, or overdue once anything is ' +
+      'owed past grace. Derived on every read from the same arrears as enforcement.',
+  })
+  standing!: LoanStanding;
 
   @ApiProperty()
   currency!: string;
@@ -248,6 +336,14 @@ export class LoanSummaryDto {
   @ApiProperty({ type: LoanBalanceDto })
   balance!: LoanBalanceDto;
 
+  @ApiProperty({
+    type: NextDueDto,
+    nullable: true,
+    description:
+      'The oldest installment not fully paid; null once all are, or once the loan is closed',
+  })
+  nextDue!: NextDueDto | null;
+
   @ApiProperty()
   createdAt!: Date;
 }
@@ -272,11 +368,11 @@ export class LoanDetailDto extends LoanSummaryDto {
   closedReason!: string | null;
 
   @ApiProperty({
-    type: NextDueDto,
     nullable: true,
-    description: 'The oldest installment not fully paid; null once all are',
+    description:
+      'When the rider stopped holding the bike under this loan; null while they still hold it',
   })
-  nextDue!: NextDueDto | null;
+  assignmentEndedAt!: Date | null;
 
   @ApiProperty({ type: InstallmentDto, isArray: true })
   schedule!: InstallmentDto[];
@@ -285,10 +381,37 @@ export class LoanDetailDto extends LoanSummaryDto {
   payments!: LoanPaymentDto[];
 }
 
+/** Loans matching the search, by standing, before the standing filter applies. */
+export class LoanCountsDto {
+  @ApiProperty()
+  all!: number;
+
+  @ApiProperty()
+  onTrack!: number;
+
+  @ApiProperty()
+  overdue!: number;
+
+  @ApiProperty()
+  completed!: number;
+
+  @ApiProperty()
+  defaulted!: number;
+
+  @ApiProperty()
+  repossessed!: number;
+
+  @ApiProperty()
+  writtenOff!: number;
+}
+
 export class LoanPageDto {
   @ApiProperty({ type: LoanSummaryDto, isArray: true })
   data!: LoanSummaryDto[];
 
   @ApiProperty({ type: PaginationMetaDto })
   meta!: PaginationMetaDto;
+
+  @ApiProperty({ type: LoanCountsDto })
+  counts!: LoanCountsDto;
 }

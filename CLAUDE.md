@@ -34,6 +34,36 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
 - Tracking (`src/tracking/`): IMEI-to-bike mapping, deduplicated position history, monotonic
   current snapshots, derived online/offline status, authenticated SSE updates, and a typed
   safety snapshot lookup for Enforcement. Read-only: bikes are added in `assets/`.
+- Fleet policy (`src/settings/`, `GET`/`PATCH /settings/policies`): the one `fleet_policies` row,
+  created on first read from `LOCKOUT_WARNING_LEAD_HOURS`, which is from then on only the starting
+  value. `LoanArrearsService.findOverdue` reads the lead time from `PoliciesService` on every
+  call (cached 15 s per process, dropped on change), so a change in Settings applies at the next
+  sweep with no restart. The default loan terms (installment, frequency, grace days) only prefill
+  the next loan: a loan's own terms never change. Reading needs no permission; changing needs
+  `user:manage`, and every change is written to `policy_changes`.
+- Staff SMS alerts (`src/notifications/staff-notifier.service.ts`, `GET`/`PUT
+  /me/notification-preferences`): each staff member turns topics on for themselves; no row means
+  off, and nobody can read or set another person's. `BIKE_OFFLINE` (tracking emits
+  `bike.went-offline` only at the moment a bike crosses the offline threshold, never for the
+  long-silent bikes at startup; assigned bikes only; once per bike per day) and `GEOFENCE_EXIT`
+  (geofences emits `geofence.exited` per recorded exit) are sent as they happen, capped at 10 an
+  hour per person. `LOAN_OVERDUE` is one digest a day per person, sent by the scheduler inside
+  messaging hours, listing loans whose oldest unpaid installment passed grace that day. Staff
+  who see the whole fleet hear about every bike; a field agent only about their own riders.
+  Each message is inserted into `staff_messages` (unique per person and event) before sending;
+  a failed send is recorded and not retried. There is no push channel.
+- Operating zones (`src/geofences/`, routes under `/geofences`): polygons drawn on the fleet
+  map (`asset:read` to list, `asset:manage` to draw, rename, redraw or remove; removed zones are
+  soft-deleted so past crossings still name them). Tracking calls `GeofencesService.observe` for
+  every new current position that has a GPS fix; a bike moving from one side of a zone to the
+  other writes a `GeofenceCrossing`, which the dashboard activity feed reads. The first position
+  seen for a bike and zone only sets the baseline (`BikeGeofenceState`), and a second crossing
+  within two minutes is ignored so GPS drift on a boundary is not a stream of alerts. The zone
+  list is cached per process for 30 s. Geometry is pure (`geometry.ts`): planar ray casting,
+  fine for city-sized zones. `GET /bikes/map` returns every trackable bike unpaged with the same
+  live block as `GET /bikes` plus `outsideZoneIds`, computed from the current position on read.
+  `GET /tracking/bikes/:id/positions` takes `keep=newest` to keep the latest rows when a window
+  holds more than `limit`.
 - Bikes (`src/assets/`, routes under `/bikes`): inventory (VIN, plate, make, model, purchase
   price in minor units with currency), tracker installation history, rider assignments, and a
   lifecycle status (`IN_INVENTORY`, `ASSIGNED`, `REPOSSESSED`, `SOLD`, `RETIRED`) with an
@@ -60,9 +90,20 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
   hands the bike back to arrears control.
 - Loans (`src/loans/`, the "contracts" of the layout below): terms, a full schedule generated
   at creation (`schedule.ts`, pure: `generateSchedule`, `allocatePayment`, `overdueMinor`), and
-  the lifecycle ACTIVE / COMPLETED / DEFAULTED / REPOSSESSED. A loan needs the bike already
-  assigned to the rider; at most one open loan per bike (partial unique index). While a loan is
-  open the bike cannot be transferred, returned or sold; repossession goes through the loan.
+  the lifecycle ACTIVE / COMPLETED / DEFAULTED / REPOSSESSED / WRITTEN_OFF. Opening a loan takes
+  a bike in stock (assigned to the rider in the same transaction) or one the rider already
+  holds. At most one open loan per bike (partial unique index) and one per rider (checked under
+  a lock on the rider row). While a loan is open the bike cannot be transferred, returned or
+  sold; repossession goes through the loan.
+  Staff see a derived **standing** (`loan-standing.ts`, pure): an active loan is on-track or
+  overdue, from the same arrears as enforcement, never stored. The list filters and counts by
+  standing in memory, like riders.
+  **Closing:** full payment completes a loan automatically (`balance.owedMinor` is the early
+  settlement figure); `POST /loans/:id/write-off` (admin) gives up the rest. A write-off debits
+  WRITE_OFF_LOSS and credits LOAN_WRITTEN_OFF for the loan, and deliberately does not credit
+  LOAN_RECEIVABLE, whose credits must stay "money paid". It frees the bike from the loan but
+  leaves the assignment alone: who has the bike is recorded on the bike. An arrears lock lifts
+  at the next sweep; a staff lock stays. A written-off loan takes no more payments.
   **The catch-up rule:** payments apply oldest installment first; an installment is overdue from
   the start of the day after `dueDate + graceDays`; a loan is current only when nothing past
   grace is owed. A partial payment reduces arrears but never clears them. "Paid" always comes
@@ -117,7 +158,7 @@ into arrears, over a raw TCP link to Teltonika devices (see *Device Telemetry* b
   (`enforcement.events.ts`) after commit and knows nothing of who listens.
 
 **Not built yet:** plans, initiating Paystack charges (the webhook expects `metadata.loan_id`),
-write-offs and reversals, refunds of rider credit, Redis/BullMQ,
+reversals, recoveries after a write-off, refunds of rider credit, Redis/BullMQ,
 customer (rider) authentication, reassigning a deactivated agent's riders, and a job to
 delete expired refresh token rows.
 

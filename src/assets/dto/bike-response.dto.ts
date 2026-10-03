@@ -100,6 +100,62 @@ export class BikeLiveDto {
   lockPending!: boolean;
 }
 
+export class BikeMapRiderDto {
+  @ApiProperty()
+  customerId!: string;
+
+  @ApiProperty()
+  firstName!: string;
+
+  @ApiProperty()
+  lastName!: string;
+}
+
+/** One bike on the fleet map: who and what it is, and the same live block /bikes returns. */
+export class BikeMapDto {
+  @ApiProperty()
+  id!: string;
+
+  @ApiProperty()
+  label!: string;
+
+  @ApiProperty({ nullable: true })
+  registrationNumber!: string | null;
+
+  @ApiProperty()
+  make!: string;
+
+  @ApiProperty()
+  model!: string;
+
+  @ApiProperty({ enum: BikeStatus })
+  status!: BikeStatus;
+
+  @ApiProperty({ nullable: true, description: 'Tracker fitted now' })
+  imei!: string | null;
+
+  @ApiProperty({ type: BikeMapRiderDto, nullable: true })
+  currentRider!: BikeMapRiderDto | null;
+
+  @ApiProperty({
+    type: MobilityDto,
+    nullable: true,
+    description: 'Null when enforcement has never acted on this bike',
+  })
+  mobility!: MobilityDto | null;
+
+  @ApiProperty({ type: BikeLiveDto })
+  live!: BikeLiveDto;
+
+  @ApiProperty({
+    type: String,
+    isArray: true,
+    description:
+      'Operating zones the bike is outside of now, by id. Empty without a position.',
+  })
+  outsideZoneIds!: string[];
+}
+
 export class BikeSummaryDto {
   @ApiProperty()
   id!: string;

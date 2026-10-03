@@ -80,8 +80,10 @@ export class EnforcementNotifierService {
               })
             : immobilizedText(holder.rider, { kind: 'staff' });
       } else {
+        // A written-off loan owes nothing overdue either, but the rider did not pay it.
         const paidUp =
           loan !== null &&
+          loan.status !== LoanStatus.WRITTEN_OFF &&
           (loan.status === LoanStatus.COMPLETED ||
             position?.overdueMinor === 0);
         body = restoredText(holder.rider, paidUp);
