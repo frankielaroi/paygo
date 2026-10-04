@@ -1,0 +1,233 @@
+# Build the PayGo API image, push it to ECR, and converge the EC2 host onto it.
+#
+# This workflow uses no third-party actions: frankielaroi/paygo restricts Actions to
+# repositories owned by frankielaroi, which excludes actions/* and aws-actions/* too.
+# Checkout is a plain git fetch with the job's own token, and the AWS credentials come
+# from the GitHub OIDC token exchanged directly against STS, so there is no long-lived
+# access key anywhere in the repository.
+#
+# One-time setup, by someone with IAM rights (see deploy/README.md):
+#   - an IAM OIDC provider for token.actions.githubusercontent.com
+#   - the paygo-github-deploy role, trusting this repository
+# Nothing else is needed: there are no repository secrets at all.
+#
+# Deployment is pull-based. The job writes the new image reference to SSM Parameter
+# Store and asks the instance to run its own /opt/paygo/deploy.sh, which renders the
+# environment from Parameter Store and converges Compose onto the new image. CI never
+# holds the application's secrets and never opens an SSH port.
+
+name: Deploy PayGo API
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      migrate:
+        description: 'Apply pending Prisma migrations after deploying'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # One deploy at a time. Two concurrent runs would race on the image parameter and
+  # could converge the host onto the older of the two.
+  group: deploy-paygo
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-north-1
+  AWS_ACCOUNT_ID: '813283043080'
+  AWS_ROLE_ARN: arn:aws:iam::813283043080:role/paygo-github-deploy
+  ECR_REPOSITORY: paygo-api
+  INSTANCE_ID: i-0220b4264b42d3958
+  PUBLIC_HOST: 13.61.227.223
+  NODE_VERSION: '22'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pushed commit
+        run: |
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "${{ github.token }}" | base64 -w0)" \
+            fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --quiet FETCH_HEAD
+
+      - name: Select Node.js
+        run: |
+          . "${NVM_DIR}/nvm.sh"
+          nvm install "${NODE_VERSION}"
+          # Each step gets a fresh shell, so publish the bin directory rather than
+          # relying on nvm's shell state.
+          nvm which "${NODE_VERSION}" | xargs dirname >> "${GITHUB_PATH}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate the Prisma client
+        run: npm run prisma:generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Device simulator tests
+        # tools/ has its own Jest config: the main one has rootDir src and would skip
+        # these silently.
+        run: npm run test:tools
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    environment:
+      name: production
+
+    steps:
+      - name: Check out the pushed commit
+        run: |
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "${{ github.token }}" | base64 -w0)" \
+            fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --quiet FETCH_HEAD
+
+      - name: Assume the AWS deploy role
+        run: |
+          set -euo pipefail
+
+          # GitHub mints a short-lived OIDC token scoped to this run.
+          ID_TOKEN="$(curl -sS -f \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+            | jq -r '.value')"
+
+          CREDS="$(aws sts assume-role-with-web-identity \
+            --role-arn "${AWS_ROLE_ARN}" \
+            --role-session-name "gha-${GITHUB_RUN_ID}" \
+            --web-identity-token "${ID_TOKEN}" \
+            --duration-seconds 3600 \
+            --query 'Credentials' --output json)"
+
+          # Mask before export: a later step that echoes its environment must not put
+          # these in a readable log.
+          echo "::add-mask::$(echo "${CREDS}" | jq -r '.SecretAccessKey')"
+          echo "::add-mask::$(echo "${CREDS}" | jq -r '.SessionToken')"
+
+          {
+            echo "AWS_ACCESS_KEY_ID=$(echo "${CREDS}" | jq -r '.AccessKeyId')"
+            echo "AWS_SECRET_ACCESS_KEY=$(echo "${CREDS}" | jq -r '.SecretAccessKey')"
+            echo "AWS_SESSION_TOKEN=$(echo "${CREDS}" | jq -r '.SessionToken')"
+            echo "AWS_DEFAULT_REGION=${AWS_REGION}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Confirm the identity
+        run: aws sts get-caller-identity --output json
+
+      - name: Build and push the image
+        id: image
+        run: |
+          set -euo pipefail
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${SHORT_SHA}"
+
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${REGISTRY}"
+
+          # The runner and the t3.micro host are both x86_64, but naming the platform
+          # keeps the image correct if either ever moves to arm64.
+          docker build --platform linux/amd64 \
+            -t "${IMAGE}" \
+            -t "${REGISTRY}/${ECR_REPOSITORY}:latest" \
+            .
+
+          docker push "${IMAGE}"
+          docker push "${REGISTRY}/${ECR_REPOSITORY}:latest"
+
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Apply pending migrations
+        if: github.event_name == 'workflow_dispatch' && inputs.migrate
+        run: |
+          set -euo pipefail
+          . "${NVM_DIR}/nvm.sh"
+          nvm install "${NODE_VERSION}" >/dev/null
+          nvm use "${NODE_VERSION}" >/dev/null
+
+          npm ci
+
+          # The database URL is read from Parameter Store, so it lives in exactly one
+          # place rather than being duplicated as a repository secret.
+          DATABASE_URL="$(aws ssm get-parameter \
+            --name /paygo/env/DATABASE_URL \
+            --with-decryption \
+            --query 'Parameter.Value' --output text)"
+          echo "::add-mask::${DATABASE_URL}"
+          export DATABASE_URL
+
+          npm run migration:deploy
+
+      - name: Point the host at the new image
+        run: |
+          aws ssm put-parameter \
+            --name /paygo/image \
+            --value "${{ steps.image.outputs.image }}" \
+            --type String --overwrite \
+            --output text --query Version
+
+      - name: Deploy on the instance
+        run: |
+          set -euo pipefail
+          COMMAND_ID="$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy $(git rev-parse --short=7 HEAD)" \
+            --timeout-seconds 600 \
+            --parameters commands=/opt/paygo/deploy.sh \
+            --query 'Command.CommandId' --output text)"
+
+          echo "SSM command ${COMMAND_ID}"
+
+          # A failed command must fail the job, but "wait" says nothing useful on its
+          # own, so the invocation is fetched either way and the status checked after.
+          set +e
+          aws ssm wait command-executed \
+            --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"
+          set -e
+
+          aws ssm get-command-invocation \
+            --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" \
+            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --output json \
+            | jq -r '"status: \(.Status)", "--- stdout ---", .Output, "--- stderr ---", .Error'
+
+          STATUS="$(aws ssm get-command-invocation \
+            --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" \
+            --query 'Status' --output text)"
+          test "${STATUS}" = "Success"
+
+      - name: Verify the deployed app answers
+        run: |
+          set -euo pipefail
+          # The certificate is self-signed until a domain is attached, hence
+          # --insecure. Once a real hostname is in place, drop the flag so a broken
+          # chain fails the deploy instead of passing it.
+          for attempt in $(seq 1 12); do
+            if curl -sS -f --insecure --max-time 10 "https://${PUBLIC_HOST}/" >/dev/null; then
+              echo "the API answered on attempt ${attempt}"
+              exit 0
+            fi
+            echo "attempt ${attempt}: not answering yet"
+            sleep 10
+          done
+          echo "the API did not answer within two minutes of deploying" >&2
+          exit 1
