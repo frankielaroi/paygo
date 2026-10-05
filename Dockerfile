@@ -34,10 +34,15 @@ COPY . .
 
 # The generated Prisma client is git-ignored TypeScript under src/generated, so it
 # has to be generated before the build, not copied in.
+# --omit=peer matters more than it looks. @prisma/client declares "prisma" and
+# "typescript" as peer dependencies, and a plain --omit=dev keeps peers, which drags
+# the Prisma CLI and all of Prisma Studio (React, Effect, electric-sql, TypeScript)
+# into the runtime image: about 250 MB for code that only "generate" and "migrate"
+# need. Migrations run from CI, never from this image.
 RUN npm run prisma:generate \
   && npm run build \
   && test -f dist/main.js \
-  && npm prune --omit=dev
+  && npm prune --omit=dev --omit=peer
 
 # ---------- runtime ----------
 FROM node:22-bookworm-slim AS runtime
