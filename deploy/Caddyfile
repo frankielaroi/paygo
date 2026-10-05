@@ -1,0 +1,28 @@
+# TLS terminates here with a certificate from Caddy's own internal CA, because the
+# deployment has no domain name yet. Clients will see an untrusted-certificate
+# warning: the traffic is encrypted, but nothing proves this host is the one you
+# meant to reach. Replace the address with a hostname and delete the "tls internal"
+# line to get a real Let's Encrypt certificate, which Caddy then renews on its own.
+
+{
+	admin off
+	# No ACME account is needed while the internal CA is in use.
+	auto_https disable_redirects
+}
+
+https://{$PAYGO_PUBLIC_HOST} {
+	tls internal
+
+	encode zstd gzip
+
+	# The app reads X-Forwarded-For for its per-IP login limit and trusts exactly one
+	# hop (TRUST_PROXY=1), which is this proxy.
+	reverse_proxy app:3000 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}
+
+# Plain HTTP answers only so a probe gets a clear redirect rather than a dead port.
+http://{$PAYGO_PUBLIC_HOST} {
+	redir https://{$PAYGO_PUBLIC_HOST}{uri} permanent
+}

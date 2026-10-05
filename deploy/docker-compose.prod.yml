@@ -1,0 +1,60 @@
+# Runs on the EC2 instance at /opt/paygo/docker-compose.yml.
+#
+# Single replica, deliberately. A device's TCP socket lives on exactly one process,
+# so a second copy of the app would make sendCommand report "not connected" for any
+# tracker attached to the other one, silently skipping an immobilization.
+
+services:
+  app:
+    image: ${PAYGO_IMAGE}
+    restart: unless-stopped
+    env_file:
+      - /opt/paygo/.env
+    ports:
+      # The Teltonika listener is published straight to the host: it is a raw TCP
+      # protocol and cannot pass through an HTTP proxy.
+      - '5027:5027'
+    # The HTTP port is NOT published. Caddy reaches it over the compose network, so
+    # the only way in from outside is through TLS.
+    expose:
+      - '3000'
+    healthcheck:
+      # GET / is the app's public liveness route.
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "require('http').get('http://127.0.0.1:3000/',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - /opt/paygo/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+volumes:
+  caddy_data:
+  caddy_config:
