@@ -8,6 +8,12 @@
 	admin off
 	# No ACME account is needed while the internal CA is in use.
 	auto_https disable_redirects
+	# A client connecting to a bare IP address sends no SNI, and Caddy then picks the
+	# certificate by the connection's local address. Inside Docker that is the
+	# container's own 172.x address, which matches no certificate, so the handshake
+	# ends in a TLS "internal error" alert even though the certificate exists. Harmless
+	# once the address is a hostname, since browsers always send SNI for a name.
+	default_sni {$PAYGO_PUBLIC_HOST}
 }
 
 https://{$PAYGO_PUBLIC_HOST} {
