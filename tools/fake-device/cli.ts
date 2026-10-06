@@ -4,6 +4,8 @@ import {
   type FakeDeviceStats,
   type SimulationScenario,
 } from './fake-device';
+import { toFleetDevices, type FleetDevice } from './fleet';
+import { ACTIVE_BIKE_STATUSES, loadActiveFleet } from './fleet-db';
 
 const SCENARIOS: SimulationScenario[] = [
   'stationary',
@@ -43,10 +45,24 @@ Simulates a real Teltonika GPS tracker (e.g. FMB920) connecting over TCP.
   --reconnect                Reconnect after the connection drops
   --reconnect-delay <number> Seconds before reconnecting (default: 3)
   --store <number>           Records the device can hold offline (default: 500)
+  --from-db                  Simulate every active bike in the database instead of
+                             generating IMEIs. Needs DATABASE_URL.
+  --db-limit <number>        With --from-db, simulate at most N bikes (default: 0 = all)
   --help                     Show this message
 
 \x1b[1mNOTE:\x1b[0m negative numbers need the equals form, because a leading dash reads as a flag:
   \x1b[32mnpm run simulator -- --lat=-1.30 --lng=36.85\x1b[0m
+
+\x1b[1mFROM THE DATABASE:\x1b[0m
+  --from-db reads every bike that has a tracker fitted and is still in the fleet
+  (status ${ACTIVE_BIKE_STATUSES.join(', ')}) and runs one device per bike, using
+  that bike's own IMEI, so the server resolves each one to a real record.
+
+  Each bike starts at its last known position when that fix was valid, and falls back
+  to --lat/--lng otherwise. Without --scenario, each bike also gets the scenario
+  matching its last telemetry: "moving" if it was last seen rolling or with its
+  ignition on, "stationary" otherwise. Passing --scenario overrides that for every
+  bike. --imei and --devices are ignored.
 
 \x1b[1mSCENARIOS:\x1b[0m
   stationary         speed 0, ignition off. The only state in which immobilizing is safe.
@@ -73,6 +89,12 @@ Simulates a real Teltonika GPS tracker (e.g. FMB920) connecting over TCP.
 
   \x1b[32m# A small fleet\x1b[0m
   npm run simulator -- --devices 5 --scenario moving
+
+  \x1b[32m# The real fleet, each bike resuming where it was last seen\x1b[0m
+  npm run simulator -- --from-db
+
+  \x1b[32m# The real fleet, all of it stationary: the state immobilizing is allowed in\x1b[0m
+  npm run simulator -- --from-db --scenario stationary
 `);
 }
 
@@ -114,12 +136,88 @@ function finiteFloat(
   return value;
 }
 
-function printSummary(stats: FakeDeviceStats[]): void {
+/** The IMEIs the simulator invents when it is not reading the real fleet. */
+function generatedFleet(options: {
+  baseImei: string;
+  deviceCount: number;
+  scenario: SimulationScenario;
+  latitude: number;
+  longitude: number;
+}): FleetDevice[] {
+  return Array.from({ length: options.deviceCount }, (_unused, i) => ({
+    imei: (BigInt(options.baseImei) + BigInt(i)).toString().padStart(15, '0'),
+    label: `device ${i + 1}`,
+    latitude: options.latitude + i * 0.005,
+    longitude: options.longitude + i * 0.005,
+    scenario: options.scenario,
+    derivedScenario: false,
+    derivedPosition: false,
+  }));
+}
+
+async function fleetFromDatabase(options: {
+  limit: number;
+  forcedScenario: SimulationScenario | undefined;
+  latitude: number;
+  longitude: number;
+}): Promise<FleetDevice[]> {
+  const rows = await loadActiveFleet({ limit: options.limit });
+  const { devices, skipped } = toFleetDevices(rows, {
+    forcedScenario: options.forcedScenario,
+    fallbackLatitude: options.latitude,
+    fallbackLongitude: options.longitude,
+  });
+
+  for (const entry of skipped) {
+    console.warn(`\x1b[33mSkipped ${entry.label}: ${entry.reason}\x1b[0m`);
+  }
+
+  if (devices.length === 0) {
+    console.error(
+      'No active bike in the database has a tracker fitted, so there is nothing to simulate. ' +
+        'Add a bike with an IMEI, or run without --from-db.',
+    );
+    process.exit(1);
+  }
+
+  const resumed = devices.filter((device) => device.derivedPosition).length;
+  console.log(
+    `Loaded ${devices.length} bike(s) from the database; ` +
+      `${resumed} resuming from their last known fix.`,
+  );
+
+  return devices;
+}
+
+/** "scenario: moving" for a uniform run, or the mix when each bike derived its own. */
+function describeScenarios(fleet: readonly FleetDevice[]): string {
+  const counts = new Map<SimulationScenario, number>();
+
+  for (const member of fleet) {
+    counts.set(member.scenario, (counts.get(member.scenario) ?? 0) + 1);
+  }
+
+  if (counts.size === 1) {
+    const [only] = [...counts.keys()];
+    return `scenario: ${only}`;
+  }
+
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, count]) => `${name}: ${count}`)
+    .join(', ');
+}
+
+function printSummary(
+  stats: FakeDeviceStats[],
+  labels: ReadonlyMap<string, string>,
+): void {
   console.log('\n\x1b[1m\x1b[36mSummary\x1b[0m');
 
   for (const s of stats) {
+    const label = labels.get(s.imei);
     console.log(
-      `  ${s.imei} [${s.scenario}] connections=${s.connections} ` +
+      `  ${s.imei}${label === undefined ? '' : ` (${label})`} [${s.scenario}] connections=${s.connections} ` +
         `packets=${s.packetsSent} records=${s.recordsSent} ` +
         `acked=${s.recordsAcknowledged} stillStored=${s.recordsStored} ` +
         `dropped=${s.recordsDropped} commands=${s.commandsReceived}`,
@@ -141,7 +239,7 @@ async function main(): Promise<void> {
       host: { type: 'string' as const, short: 'h', default: '127.0.0.1' },
       port: { type: 'string' as const, short: 'p', default: '5027' },
       imei: { type: 'string' as const, short: 'i', default: '356892080000001' },
-      scenario: { type: 'string' as const, short: 's', default: 'stationary' },
+      scenario: { type: 'string' as const, short: 's' },
       interval: { type: 'string' as const, short: 't', default: '10' },
       lat: { type: 'string' as const, default: '-1.2921' },
       lng: { type: 'string' as const, default: '36.8219' },
@@ -151,6 +249,8 @@ async function main(): Promise<void> {
       reconnect: { type: 'boolean' as const, default: false },
       'reconnect-delay': { type: 'string' as const, default: '3' },
       store: { type: 'string' as const, default: '500' },
+      'from-db': { type: 'boolean' as const, default: false },
+      'db-limit': { type: 'string' as const, default: '0' },
       help: { type: 'boolean' as const, default: false },
     },
     allowPositionals: true,
@@ -161,14 +261,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  const scenario = (values.scenario ?? 'stationary') as SimulationScenario;
+  // Left undefined, --from-db gives each bike the scenario matching its own last telemetry.
+  // Everything else keeps the historical default.
+  const explicitScenario = values.scenario as SimulationScenario | undefined;
 
-  if (!SCENARIOS.includes(scenario)) {
+  if (explicitScenario !== undefined && !SCENARIOS.includes(explicitScenario)) {
     console.error(
-      `Invalid scenario: "${scenario}". Valid choices: ${SCENARIOS.join(', ')}`,
+      `Invalid scenario: "${explicitScenario}". Valid choices: ${SCENARIOS.join(', ')}`,
     );
     process.exit(1);
   }
+
+  const scenario = explicitScenario ?? 'stationary';
 
   const host = values.host ?? '127.0.0.1';
   const port = positiveInt(values.port, 5027, 'port');
@@ -189,37 +293,45 @@ async function main(): Promise<void> {
   );
   const maxStoredRecords = Math.max(1, positiveInt(values.store, 500, 'store'));
 
-  if (!/^\d{8,17}$/.test(baseImei)) {
+  const fromDb = values['from-db'] === true;
+  const dbLimit = positiveInt(values['db-limit'], 0, 'db-limit');
+
+  if (!fromDb && !/^\d{8,17}$/.test(baseImei)) {
     console.error(`Invalid --imei: "${baseImei}". Expected 8 to 17 digits.`);
     process.exit(1);
   }
 
+  const fleet = fromDb
+    ? await fleetFromDatabase({
+        limit: dbLimit,
+        forcedScenario: explicitScenario,
+        latitude,
+        longitude,
+      })
+    : generatedFleet({ baseImei, deviceCount, scenario, latitude, longitude });
+
   console.log(
-    `\x1b[1m\x1b[36mStarting ${deviceCount} fake device(s) against ${host}:${port} [scenario: ${scenario}]\x1b[0m\n`,
+    `\x1b[1m\x1b[36mStarting ${fleet.length} fake device(s) against ${host}:${port}` +
+      ` [${describeScenarios(fleet)}]\x1b[0m\n`,
   );
 
-  const devices: FakeDevice[] = [];
-
-  for (let i = 0; i < deviceCount; i += 1) {
-    const imei = (BigInt(baseImei) + BigInt(i)).toString().padStart(15, '0');
-
-    devices.push(
+  const devices = fleet.map(
+    (member) =>
       new FakeDevice({
         host,
         port,
-        imei,
-        scenario,
+        imei: member.imei,
+        scenario: member.scenario,
         intervalSeconds,
-        latitude: latitude + i * 0.005,
-        longitude: longitude + i * 0.005,
+        latitude: member.latitude,
+        longitude: member.longitude,
         maxPackets,
         batchSize,
         reconnect: values.reconnect === true ? true : undefined,
         reconnectDelaySeconds,
         maxStoredRecords,
       }),
-    );
-  }
+  );
 
   let shuttingDown = false;
 
@@ -248,7 +360,10 @@ async function main(): Promise<void> {
     ),
   );
 
-  printSummary(stats);
+  printSummary(
+    stats,
+    new Map(fleet.map((member) => [member.imei, member.label])),
+  );
 }
 
 void main();
