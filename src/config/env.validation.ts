@@ -108,6 +108,57 @@ const trustProxy = emptyAsUndefined(
   return value.split(',').map((entry) => entry.trim());
 });
 
+/** "https://app.example.com" or "http://localhost:5173": exactly what a browser sends as Origin. */
+function isOrigin(entry: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(entry);
+  } catch {
+    return false;
+  }
+  // url.origin drops a path, query, credentials and trailing slash, so comparing it with the
+  // entry refuses all of those: a browser's Origin header never carries them, and an entry
+  // that does would silently never match. The URL parser accepts "*" in a host name, and
+  // origins are compared as exact strings, so a wildcard host would match nothing either.
+  return (
+    (url.protocol === 'https:' || url.protocol === 'http:') &&
+    url.origin === entry &&
+    !entry.includes('*')
+  );
+}
+
+/**
+ * The browser origins allowed to call the API, parsed to a list. Empty (the default) leaves
+ * CORS off, so only same-origin pages and non-browser clients get through. "*" is refused:
+ * the API is a back office behind bearer tokens, and naming the frontends is what keeps a
+ * token lifted from one of them from being usable by a page on any other site.
+ */
+const corsOrigins = emptyAsUndefined(
+  z
+    .string()
+    .trim()
+    .superRefine((value, context) => {
+      const entries = value.split(',').map((entry) => entry.trim());
+      if (entries.includes('*')) {
+        context.addIssue({
+          code: 'custom',
+          message: 'name the frontend origins instead of "*"',
+        });
+        return;
+      }
+      const invalid = entries.filter((entry) => !isOrigin(entry));
+      if (invalid.length > 0) {
+        context.addIssue({
+          code: 'custom',
+          message: `must be comma-separated origins such as https://app.example.com, with no path or trailing slash (got ${invalid.map((entry) => `"${entry}"`).join(', ')})`,
+        });
+      }
+    })
+    .optional(),
+).transform((value): string[] =>
+  value === undefined ? [] : value.split(',').map((entry) => entry.trim()),
+);
+
 export const envSchema = z
   .object({
     NODE_ENV: z
@@ -150,6 +201,9 @@ export const envSchema = z
     // API from its server) all staff share one login limit. Set it to the frontend's or load
     // balancer's address; leave it unset when clients connect directly.
     TRUST_PROXY: trustProxy,
+
+    // Browser origins allowed to call the API. Unset means no cross-origin access at all.
+    CORS_ORIGINS: corsOrigins,
 
     // Device TCP listener. Disabled in tests unless a spec turns it on with port 0, so a test run
     // does not fight the dev server for the port.

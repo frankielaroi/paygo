@@ -128,6 +128,43 @@ describe('validateEnv', () => {
     );
   });
 
+  describe('CORS_ORIGINS', () => {
+    const corsOrigins = (value?: string) =>
+      validateEnv({ ...valid, CORS_ORIGINS: value }).CORS_ORIGINS;
+
+    it('allows no origin by default', () => {
+      expect(corsOrigins(undefined)).toEqual([]);
+      expect(corsOrigins('')).toEqual([]);
+    });
+
+    it('reads a list of origins', () => {
+      expect(
+        corsOrigins('https://paygofrontend.vercel.app, http://localhost:5173'),
+      ).toEqual(['https://paygofrontend.vercel.app', 'http://localhost:5173']);
+    });
+
+    // A wildcard would let a page on any site call the API with a token it got hold of.
+    it('refuses "*"', () => {
+      expect(() => corsOrigins('*')).toThrow(/instead of "\*"/);
+      expect(() => corsOrigins('https://app.example.com,*')).toThrow(
+        /instead of "\*"/,
+      );
+    });
+
+    // Each of these would boot and then never match the Origin header a browser sends, which
+    // looks like CORS being broken rather than like a typo in the environment.
+    it.each([
+      'https://app.example.com/',
+      'https://app.example.com/login',
+      'app.example.com',
+      'ftp://app.example.com',
+      'https://*.vercel.app',
+      'https://app.example.com,',
+    ])('refuses %s', (value) => {
+      expect(() => corsOrigins(value)).toThrow(/CORS_ORIGINS/);
+    });
+  });
+
   it('rejects a seed password that is too short to be worth setting', () => {
     expect(() =>
       validateEnv({ ...valid, SEED_ADMIN_PASSWORD: 'short' }),
