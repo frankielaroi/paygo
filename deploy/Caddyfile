@@ -1,12 +1,18 @@
-# TLS terminates here with a certificate from Caddy's own internal CA, because the
-# deployment has no domain name yet. Clients will see an untrusted-certificate
-# warning: the traffic is encrypted, but nothing proves this host is the one you
-# meant to reach. Replace the address with a hostname and delete the "tls internal"
-# line to get a real Let's Encrypt certificate, which Caddy then renews on its own.
+# TLS terminates here with a Let's Encrypt certificate for the hostname in
+# /paygo/public-host, which Caddy obtains and renews on its own. That needs the name
+# to resolve to this instance and ports 80 and 443 to be reachable, nothing else.
+#
+# The certificate and the ACME account live in the caddy_data volume. Keep it:
+# Let's Encrypt limits how often a name can be issued, and a host that loses the
+# volume and redeploys repeatedly can be refused a certificate for days.
+#
+# With a bare IP address instead of a hostname, add "tls internal" to the site block
+# below. Caddy's own CA then issues the certificate and clients see an untrusted
+# warning: encrypted, but nothing proves the host is the one they meant to reach.
 
 {
 	admin off
-	# No ACME account is needed while the internal CA is in use.
+	# The redirect is written out below so a probe on port 80 gets an explicit answer.
 	auto_https disable_redirects
 	# A client connecting to a bare IP address sends no SNI, and Caddy then picks the
 	# certificate by the connection's local address. Inside Docker that is the
@@ -17,8 +23,6 @@
 }
 
 https://{$PAYGO_PUBLIC_HOST} {
-	tls internal
-
 	encode zstd gzip
 
 	# The app reads X-Forwarded-For for its per-IP login limit and trusts exactly one
