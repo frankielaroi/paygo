@@ -118,6 +118,35 @@ The stack is a systemd unit (`paygo.service`), so it comes back on reboot, and t
 containers carry `restart: unless-stopped`. A crash drops every device connection at
 once and silently, which is what the unit and the restart policy are there for.
 
+## Demo fleet simulator
+
+Production currently holds demo data (`npm run db:seed:demo`), and a timer on the host keeps
+that fleet looking alive. Every five minutes `paygo-fleet-sim.timer` starts one run of
+`tools/fleet-sim`: each demo bike with a tracker connects to the device listener as its own
+IMEI, reports for 270 seconds, and disconnects. Some ride, most are parked, about one in
+twenty stays offline for a two-hour slot, and a locked or repossessed bike never moves. The
+simulated trackers answer lock and unlock commands, so enforcement runs end to end.
+
+It is a systemd timer, not a crontab: Amazon Linux 2023 ships without cron.
+
+- **It only speaks for IMEIs starting `3520940`**, the range the demo seed issues, so it cannot
+  impersonate a real tracker. Turn it off anyway before real riders are on this database.
+- It runs in the app's image with host networking, reads `DATABASE_URL` from `/opt/paygo/.env`,
+  and is capped at 192 MB.
+- The files in `deploy/fleet-sim` and the built `fleet-sim.cjs` were copied to the host by
+  hand (`/opt/paygo/fleet-sim`, and the two units to `/etc/systemd/system`). A replaced host
+  comes up without the simulator until they are copied again.
+
+```bash
+# Rebuild after changing tools/fleet-sim, then copy fleet-sim.cjs to /opt/paygo/fleet-sim
+npm run build:fleet-sim
+
+# On the host: last runs, stop, start
+journalctl -u paygo-fleet-sim.service --since -30min | grep bikes
+sudo systemctl disable --now paygo-fleet-sim.timer
+sudo systemctl enable --now paygo-fleet-sim.timer
+```
+
 ## Open items
 
 - **TLS is a self-signed certificate** from Caddy's internal CA. Traffic is encrypted,
