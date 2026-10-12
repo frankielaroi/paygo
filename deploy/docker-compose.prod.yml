@@ -42,6 +42,15 @@ services:
     restart: unless-stopped
     depends_on:
       - app
+    environment:
+      # The Caddyfile resolves {$PAYGO_PUBLIC_HOST} from Caddy's own process
+      # environment, and Compose does not pass the host's variables into a container
+      # unless the service asks for them. Without this line the site address collapses
+      # to an empty host: Caddy still binds :443, but it has no name to issue a
+      # certificate for, so its certificate store stays empty and every TLS handshake
+      # fails while port 80 still answers. deploy.sh exports this before it calls
+      # "docker compose up", so Compose has the value to interpolate.
+      PAYGO_PUBLIC_HOST: ${PAYGO_PUBLIC_HOST:?set by deploy.sh from /paygo/public-host}
     ports:
       - '80:80'
       - '443:443'

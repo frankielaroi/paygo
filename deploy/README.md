@@ -7,7 +7,7 @@ app and a Caddy TLS proxy in front of it.
 | --- | --- |
 | Instance | `i-0220b4264b42d3958` (t3.micro, Amazon Linux 2023) |
 | Address | `13.61.227.223` (Elastic IP `eipalloc-07493751f24a603af`) |
-| API | `https://13.61.227.223` |
+| API | `https://paygo.duckdns.org` (DuckDNS name pointing at the Elastic IP) |
 | Device port | `13.61.227.223:5027`, raw TCP |
 | Image | `813283043080.dkr.ecr.eu-north-1.amazonaws.com/paygo-api` |
 | Security group | `sg-0af0eeb5de93c1ee4` (`paygo-api`) |
@@ -149,12 +149,15 @@ sudo systemctl enable --now paygo-fleet-sim.timer
 
 ## Open items
 
-- **TLS is a self-signed certificate** from Caddy's internal CA. Traffic is encrypted,
-  but nothing proves the host is the one you meant to reach, and clients must skip
-  verification to connect. Point a hostname at `13.61.227.223`, set
-  `/paygo/public-host` to it, and remove `tls internal` from the Caddyfile: Caddy then
-  gets a Let's Encrypt certificate and renews it on its own. Until then, staff
-  passwords and refresh tokens are protected against passive eavesdropping only.
+- **The hostname is a free DuckDNS name** (`paygo.duckdns.org`), with a Let's Encrypt
+  certificate that Caddy renews on its own. It is fine for a pilot, but the name
+  belongs to a personal DuckDNS account, and the Paystack and Arkesel callback URLs
+  will carry it. Before real riders depend on it, move to a domain the business
+  owns: point it at `13.61.227.223`, set `/paygo/public-host`, rerun the deploy, and
+  update the API address in the frontend and in the provider callbacks.
+- **The files in `/opt/paygo` are not copied from this repository.** `deploy.sh` pulls
+  the image and nothing else, so a change to `deploy/Caddyfile` or
+  `deploy/docker-compose.prod.yml` has to be applied on the instance by hand.
 - **Port 5027 is open to `0.0.0.0/0`.** Devices roam on mobile APNs, so the source
   range is not known yet. The IMEI handshake is not authentication (an IMEI is
   guessable and spoofable), so narrow this to the operator's ranges once they are
