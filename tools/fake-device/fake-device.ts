@@ -46,6 +46,11 @@ export interface FakeDeviceOptions {
    * oldest when full, so this simulates loss rather than growing without bound.
    */
   maxStoredRecords?: number;
+  /**
+   * Supplies each record instead of the scenario's fixed motion, for a caller that models its own
+   * route. The scenario still decides how the connection behaves.
+   */
+  recordSource?: () => TelemetryDataOptions;
   logger?: (msg: string, level?: LogLevel) => void;
 }
 
@@ -79,6 +84,7 @@ export class FakeDevice {
   private readonly reconnectDelaySeconds: number;
   private readonly maxStoredRecords: number;
   private readonly ackTimeoutMs: number;
+  private readonly recordSource: (() => TelemetryDataOptions) | null;
   private readonly log: (msg: string, level?: LogLevel) => void;
 
   private socket: net.Socket | null = null;
@@ -126,6 +132,7 @@ export class FakeDevice {
       (options.ackTimeoutSeconds ?? Math.max(2, this.intervalSeconds)) * 1000;
     // The reconnect scenario is about coming back, so it implies reconnecting.
     this.reconnectEnabled = options.reconnect ?? this.scenario === 'reconnect';
+    this.recordSource = options.recordSource ?? null;
 
     this.log =
       options.logger ??
@@ -417,6 +424,13 @@ export class FakeDevice {
   }
 
   private nextRecord(): TelemetryDataOptions {
+    if (this.recordSource) {
+      const record = this.recordSource();
+      this.lat = record.latitude;
+      this.lng = record.longitude;
+      return record;
+    }
+
     let speed = 0;
     let ignition = false;
     let movement = false;
