@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import { setupCors } from './config/cors';
 import type { Env } from './config/env.validation';
 import { SWAGGER_PATH, setupSwagger } from './config/swagger';
 
@@ -20,6 +21,14 @@ async function bootstrap() {
   app.set('trust proxy', trustProxy);
   if (trustProxy !== false) {
     logger.log(`Trusting X-Forwarded-For from: ${String(trustProxy)}`);
+  }
+
+  // Off unless CORS_ORIGINS names a frontend.
+  const corsOrigins = app
+    .get<ConfigService<Env, true>>(ConfigService)
+    .get('CORS_ORIGINS', { infer: true });
+  if (setupCors(app, corsOrigins)) {
+    logger.log(`CORS allowed for: ${corsOrigins.join(', ')}`);
   }
 
   app.useGlobalPipes(

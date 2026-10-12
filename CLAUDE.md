@@ -783,6 +783,7 @@ Expected variables:
 | `JWT_EXPIRES_IN` | Access token lifetime (default `15m`) |
 | `JWT_ISSUER` | Expected `iss` claim, verified on every request (default `paygo`) |
 | `SWAGGER_ENABLED` | Set to `true` to publish `/api` in production |
+| `CORS_ORIGINS` | Comma-separated browser origins allowed to call the API (no path, no trailing slash, `*` refused). Unset: no cross-origin access |
 | `REFRESH_TOKEN_TTL_DAYS` | Refresh token lifetime (default 30) |
 | `LOGIN_MAX_ATTEMPTS` | Failed logins before a per-account lockout (default 5) |
 | `LOGIN_LOCKOUT_MINUTES` | Lockout duration; keep it short (default 15) |
