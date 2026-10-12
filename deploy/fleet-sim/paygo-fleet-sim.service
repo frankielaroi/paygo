@@ -1,0 +1,10 @@
+[Unit]
+Description=PayGo demo fleet simulator (one run)
+After=paygo.service docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/paygo/fleet-sim/run.sh
+# A run reports for 270 seconds. Anything much longer is stuck.
+TimeoutStartSec=330

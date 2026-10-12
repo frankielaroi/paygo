@@ -28,6 +28,8 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:seed:demo": "tsx prisma/seed-demo.ts",
     "simulator": "tsx tools/fake-device/cli.ts",
+    "fleet-sim": "tsx tools/fleet-sim/cli.ts",
+    "build:fleet-sim": "esbuild tools/fleet-sim/cli.ts --bundle --platform=node --target=node22 --external:pg --outfile=deploy/fleet-sim/fleet-sim.cjs",
     "test:tools": "jest --config ./tools/jest.config.json",
     "test:all": "npm test && npm run test:tools && npm run test:e2e"
   },

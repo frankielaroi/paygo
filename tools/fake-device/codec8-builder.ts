@@ -11,6 +11,10 @@ export interface TelemetryDataOptions {
   speed: number;
   ignition?: boolean;
   movement?: boolean;
+  /** IO 66, external voltage in mV. Omitted from the record when not set. */
+  externalVoltageMv?: number;
+  /** IO 16, total odometer in metres. Omitted from the record when not set. */
+  odometerMeters?: number;
   corruptCrc?: boolean;
   corruptData?: boolean;
 }
@@ -85,6 +89,7 @@ export function buildCodec8Packet(options: TelemetryDataOptions): Buffer {
 
 /**
  * One AVL record: header (9) + GPS (15) + IO (10) = 34 bytes with two one-byte IO properties.
+ * External voltage adds a two-byte property (3 bytes) and the odometer a four-byte one (5 bytes).
  */
 function buildAvlRecord(options: TelemetryDataOptions): Buffer {
   const timestamp = BigInt(options.timestamp ?? Date.now());
@@ -97,9 +102,14 @@ function buildAvlRecord(options: TelemetryDataOptions): Buffer {
   const speed = options.speed;
   const ignition = options.ignition ?? false;
   const movement = options.movement ?? false;
+  const voltage = options.externalVoltageMv;
+  const odometer = options.odometerMeters;
+  const hasVoltage = voltage !== undefined;
+  const hasOdometer = odometer !== undefined;
 
-  // Record header (9 bytes) + GPS (15 bytes) + IO (10 bytes) = 34 bytes
-  const avlRecord = Buffer.alloc(34);
+  const avlRecord = Buffer.alloc(
+    34 + (hasVoltage ? 3 : 0) + (hasOdometer ? 5 : 0),
+  );
   let offset = 0;
 
   // Timestamp (8 bytes)
@@ -124,10 +134,13 @@ function buildAvlRecord(options: TelemetryDataOptions): Buffer {
   avlRecord.writeUInt16BE(speed, offset); // Speed (2 bytes)
   offset += 2;
 
-  // IO Element (10 bytes)
+  // IO Element
   avlRecord.writeUInt8(0, offset); // Event IO ID (0 = periodic)
   offset += 1;
-  avlRecord.writeUInt8(2, offset); // Total N of properties (2)
+  avlRecord.writeUInt8(
+    2 + (hasVoltage ? 1 : 0) + (hasOdometer ? 1 : 0),
+    offset,
+  ); // Total N
   offset += 1;
 
   // N1 (1-byte IO count = 2)
@@ -146,13 +159,28 @@ function buildAvlRecord(options: TelemetryDataOptions): Buffer {
   avlRecord.writeUInt8(movement ? 1 : 0, offset);
   offset += 1;
 
-  // N2 (2-byte IO count = 0)
-  avlRecord.writeUInt8(0, offset);
+  // N2 (2-byte IO count), IO 66: external voltage in mV
+  avlRecord.writeUInt8(hasVoltage ? 1 : 0, offset);
   offset += 1;
+  if (hasVoltage) {
+    avlRecord.writeUInt8(66, offset);
+    offset += 1;
+    avlRecord.writeUInt16BE(Math.max(0, Math.min(voltage, 0xffff)), offset);
+    offset += 2;
+  }
 
-  // N4 (4-byte IO count = 0)
-  avlRecord.writeUInt8(0, offset);
+  // N4 (4-byte IO count), IO 16: total odometer in metres
+  avlRecord.writeUInt8(hasOdometer ? 1 : 0, offset);
   offset += 1;
+  if (hasOdometer) {
+    avlRecord.writeUInt8(16, offset);
+    offset += 1;
+    avlRecord.writeUInt32BE(
+      Math.max(0, Math.min(odometer, 0xffffffff)),
+      offset,
+    );
+    offset += 4;
+  }
 
   // N8 (8-byte IO count = 0)
   avlRecord.writeUInt8(0, offset);

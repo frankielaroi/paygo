@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the PayGo demo fleet simulator every five minutes
+
+[Timer]
+# Each run reports for 270 seconds, so runs nearly meet and a bike is never silent for
+# long enough (TRACKING_OFFLINE_AFTER_SECONDS, 300) to look offline by accident.
+OnCalendar=*:0/5
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
